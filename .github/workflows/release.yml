@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - name: Check out SpectralFix
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Validate tag and project version
         shell: pwsh
@@ -37,7 +37,7 @@ jobs:
           }
 
       - name: Check out the pinned Ashita SDK
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: AshitaXI/Ashita-v4beta
           ref: ${{ matrix.ashita_ref }}
@@ -51,7 +51,7 @@ jobs:
           -AshitaSdkPath '${{ github.workspace }}\deps\ashita\plugins\sdk'
 
       - name: Upload release package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SpectralFix-Ashita-${{ matrix.interface }}
           path: out/packages/*.zip
@@ -64,7 +64,7 @@ jobs:
 
     steps:
       - name: Download packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
