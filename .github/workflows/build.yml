@@ -1,0 +1,45 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Ashita ${{ matrix.interface }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - interface: '4.16'
+            ashita_ref: a362f9e3594c7ba8e9e3108b77b0033230ee1373
+          - interface: '4.30'
+            ashita_ref: 2e4b9c86de538ecfedabab918537c550d6378aaa
+
+    steps:
+      - name: Check out SpectralFix
+        uses: actions/checkout@v4
+
+      - name: Check out the pinned Ashita SDK
+        uses: actions/checkout@v4
+        with:
+          repository: AshitaXI/Ashita-v4beta
+          ref: ${{ matrix.ashita_ref }}
+          path: deps/ashita
+
+      - name: Build, test, and package
+        shell: pwsh
+        run: >-
+          ./scripts/Build-One.ps1
+          -AshitaVersion '${{ matrix.interface }}'
+          -AshitaSdkPath '${{ github.workspace }}\deps\ashita\plugins\sdk'
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpectralFix-Ashita-${{ matrix.interface }}
+          path: out/packages/*.zip
+          if-no-files-found: error

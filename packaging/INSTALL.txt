@@ -1,0 +1,19 @@
+SpectralFix installation
+========================
+
+1. Exit Final Fantasy XI completely.
+2. Confirm this package matches your Ashita plugin interface version.
+3. Copy spectralfix.dll into Ashita's plugins folder.
+4. Add this near the top of the Ashita startup script:
+
+   /load spectralfix
+
+5. Launch the game. SpectralFix prints one short startup message.
+6. Use /spectralfix help to see normal settings.
+
+Do not unload or reload SpectralFix while the game is running. Exit the entire
+client before updating or removing the DLL.
+
+Defaults: target 2048, spread 2.0, stock shifted-glow opacity, center glow 25%.
+Settings are saved to ashita/config/spectralfix.ini.
+Diagnostics are written to ashita/logs/spectralfix/spectralfix.log.
