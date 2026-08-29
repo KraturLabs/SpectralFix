@@ -2,6 +2,15 @@
 
 All notable user-facing changes are recorded here.
 
+## 1.01 - 2026-08-29
+
+- Document that FFXI's Blur Effect must be enabled before game startup and that
+  the old `/localsettings blureffect off` workaround must be removed.
+- Clarify that SpectralFix must load from Ashita's startup script rather than be
+  loaded manually after login.
+- Clarify that the 4.16 and 4.30 package labels identify Ashita plugin interface
+  versions, not necessarily the launcher version.
+
 ## 1.0 - 2026-08-28
 
 - Correct FFXI actor-aura edges with a verified 2048x2048 render target.

@@ -26,16 +26,20 @@ Ashita whenever the game starts.
 
 The release page provides two downloads:
 
-- `SpectralFix-v1.0-Ashita-4.16.zip`
-- `SpectralFix-v1.0-Ashita-4.30.zip`
+- `SpectralFix-v1.01-Ashita-4.16.zip`
+- `SpectralFix-v1.01-Ashita-4.30.zip`
 
-Choose the version matching your Ashita installation. If you choose the wrong
-one, Ashita will refuse to load it rather than damage anything.
+The `4.16` and `4.30` labels are Ashita **plugin interface** versions, not
+necessarily the version shown by the launcher. If you choose the wrong package,
+Ashita will refuse to load it rather than damage anything; try the other package
+or include your Ashita log when asking which one you need.
 
 ## Installation
 
-> **Required:** FFXI's Blur Effect must be enabled when the game starts.
-> If you started the game with it disabled, run
+> **Required:** FFXI's Blur Effect must be enabled before the game starts and
+> remain enabled. Remove any `/localsettings blureffect off` line left in your
+> startup scripts from the old workaround. If you started the game with it
+> disabled, run
 > `/localsettings blureffect on`, fully exit FFXI, and then relaunch. Simply
 > dismissing and resummoning the glowing character is not enough.
 
@@ -45,6 +49,9 @@ one, Ashita will refuse to load it rather than damage anything.
 4. Add `/load spectralfix` near the top of the Ashita startup script, before
    ordinary plugins and addons.
 5. Launch the game normally.
+
+Do not wait until after login and load SpectralFix manually. It must load from
+the startup script so it is present when FFXI creates the aura resources.
 
 Do not unload or reload SpectralFix while the game is running. Exit the entire
 client before replacing or removing the DLL.
@@ -79,6 +86,10 @@ Changes are saved for future launches.
 If SpectralFix loads but the aura remains jagged, first confirm that Blur Effect
 was enabled before this game session started. Run `/localsettings blureffect on`,
 fully exit FFXI, relaunch, and try the aura again.
+
+Also confirm that `/load spectralfix` is near the top of the startup script. If
+you loaded it manually after login, fully exit FFXI and let the startup script
+load it during the next launch.
 
 Run `/spectralfix status` and include the displayed information when reporting the
 problem. SpectralFix also keeps a small troubleshooting log in
