@@ -34,6 +34,11 @@ one, Ashita will refuse to load it rather than damage anything.
 
 ## Installation
 
+> **Required:** FFXI's Blur Effect must be enabled when the game starts.
+> If you started the game with it disabled, run
+> `/localsettings blureffect on`, fully exit FFXI, and then relaunch. Simply
+> dismissing and resummoning the glowing character is not enough.
+
 1. Exit Final Fantasy XI completely.
 2. Download and extract the package matching your Ashita interface.
 3. Copy `spectralfix.dll` into Ashita's `plugins` folder.
@@ -70,6 +75,10 @@ Use `stock` instead of a number to restore the original opacity behavior, or use
 Changes are saved for future launches.
 
 ## If something goes wrong
+
+If SpectralFix loads but the aura remains jagged, first confirm that Blur Effect
+was enabled before this game session started. Run `/localsettings blureffect on`,
+fully exit FFXI, relaunch, and try the aura again.
 
 Run `/spectralfix status` and include the displayed information when reporting the
 problem. SpectralFix also keeps a small troubleshooting log in

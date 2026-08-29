@@ -39,6 +39,16 @@ These revisions exactly match the `Ashita.h` files in the two tested client SDKs
 - Native Windows D3D8: the compatibility branch previously passed Lion II summon,
   dismissal, zoning, resummon, and XIUI coexistence without a top-left copy.
 
+## Blur Effect startup prerequisite
+
+The Ashita path requires FFXI's Blur Effect to be enabled before the game creates
+its aura resources. A verified launch with Blur Effect disabled created only one
+candidate: SpectralFix loaded and enlarged it, but correction remained inactive
+with `scaled=0`, `tap_draws=0`, and increasing `unmarked_blur_draws`. Running
+`/localsettings blureffect on`, fully exiting FFXI, and relaunching restored the
+normal two-candidate path, selector confirmation, and nonzero scale/tap
+corrections. Resummoning without a full restart did not rebuild the resources.
+
 ## Standalone v1.0 release-candidate verification
 
 - Both pinned SDK builds complete as 32-bit Release with `/W4 /WX`.

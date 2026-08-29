@@ -1,6 +1,10 @@
 SpectralFix installation
 ========================
 
+Required: FFXI's Blur Effect must be enabled when the game starts. If you
+started the game with it disabled, run /localsettings blureffect on, fully exit
+FFXI, and then relaunch. Dismissing and resummoning the character is not enough.
+
 1. Exit Final Fantasy XI completely.
 2. Confirm this package matches your Ashita plugin interface version.
 3. Copy spectralfix.dll into Ashita's plugins folder.
