@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(SpectralFix VERSION 1.01 LANGUAGES CXX)
+project(SpectralFix VERSION 1.02 LANGUAGES CXX)
 
 if (NOT WIN32)
     message(FATAL_ERROR "SpectralFix is a 32-bit Windows Ashita plugin.")
@@ -88,6 +88,59 @@ set_target_properties(spectralfix_selector_policy_validation PROPERTIES
 )
 spectralfix_msvc_defaults(spectralfix_selector_policy_validation)
 add_test(NAME spectralfix_selector_policy COMMAND spectralfix_selector_policy_validation)
+
+add_executable(spectralfix_settings_validation tests/settings_validation.cpp)
+target_include_directories(spectralfix_settings_validation PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_compile_features(spectralfix_settings_validation PRIVATE cxx_std_20)
+set_target_properties(spectralfix_settings_validation PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+spectralfix_msvc_defaults(spectralfix_settings_validation)
+if (MSVC)
+    target_compile_options(spectralfix_settings_validation PRIVATE /EHsc)
+endif()
+add_test(NAME spectralfix_settings COMMAND spectralfix_settings_validation)
+
+add_executable(spectralfix_hook_policy_validation tests/hook_policy_validation.cpp)
+target_include_directories(spectralfix_hook_policy_validation PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_compile_features(spectralfix_hook_policy_validation PRIVATE cxx_std_20)
+set_target_properties(spectralfix_hook_policy_validation PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+spectralfix_msvc_defaults(spectralfix_hook_policy_validation)
+add_test(NAME spectralfix_hook_policy COMMAND spectralfix_hook_policy_validation)
+
+add_executable(spectralfix_runtime_safety_validation tests/runtime_safety_validation.cpp)
+target_include_directories(spectralfix_runtime_safety_validation PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_compile_features(spectralfix_runtime_safety_validation PRIVATE cxx_std_20)
+set_target_properties(spectralfix_runtime_safety_validation PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+spectralfix_msvc_defaults(spectralfix_runtime_safety_validation)
+add_test(NAME spectralfix_runtime_safety COMMAND spectralfix_runtime_safety_validation)
+
+add_executable(spectralfix_composite_state_validation tests/composite_state_validation.cpp)
+target_include_directories(spectralfix_composite_state_validation PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${ASHITA_SDK_PATH}"
+)
+target_compile_features(spectralfix_composite_state_validation PRIVATE cxx_std_20)
+target_compile_definitions(spectralfix_composite_state_validation PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+set_target_properties(spectralfix_composite_state_validation PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+spectralfix_msvc_defaults(spectralfix_composite_state_validation)
+if (MSVC)
+    target_compile_options(spectralfix_composite_state_validation PRIVATE /EHsc)
+endif()
+add_test(NAME spectralfix_composite_state
+    COMMAND spectralfix_composite_state_validation)
 
 add_executable(spectralfix_wrapper_smoke tests/wrapper_smoke.cpp)
 target_include_directories(spectralfix_wrapper_smoke PRIVATE "${ASHITA_SDK_PATH}")

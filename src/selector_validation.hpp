@@ -1,5 +1,7 @@
 #pragma once
 
+#include "settings.hpp"
+
 #include <cstdint>
 
 namespace spectralfix
@@ -14,11 +16,11 @@ namespace spectralfix
         const uint32_t targetSize)
     {
         (void)callerRva;
-        return version == 1
+        return version == kSettingsVersion
             && moduleTimestamp != 0
             && moduleSize != 0
             && stackHash != 0
             && signatureOrdinal != 0
-            && (targetSize == 1024 || targetSize == 2048 || targetSize == 4096);
+            && target_size_supported(targetSize);
     }
 }

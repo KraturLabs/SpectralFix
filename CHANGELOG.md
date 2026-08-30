@@ -2,6 +2,26 @@
 
 All notable user-facing changes are recorded here.
 
+## 1.02 - 2026-08-29
+
+- Keep every live enlarged aura safely corrected through selector mismatches, plugin
+  conflicts, direct unload attempts, and `UnloadAll`. Unsafe unloads now retain the
+  correction only for shutdown and clearly tell the player to exit the client.
+- Improve coexistence with native D3D8, dgVoodoo2, and later graphics hooks.
+  Unknown hook owners are monitored in place, avoiding recursive hook chains while
+  warning if the correction path is genuinely lost.
+- Restrict aura selection to Ashita's exact Direct3D device and a verified FFXiMain
+  allocation path, preventing unrelated matching resources from being enlarged.
+- If a graphics operation fails, put the game's graphics settings back exactly as
+  they were. If SpectralFix can no longer prove a texture belongs to the aura, keep
+  the required correction but stop optional appearance adjustments.
+- Make settings and startup more reliable: create missing folders, save appearance
+  settings before the aura allocation is learned, reject malformed values, tolerate
+  settings added by future versions, and keep working when the log is unavailable.
+- Prevent failure spam and unsafe partial setup: show one clear warning for a
+  repeated rendering problem, keep log files bounded, safely track or undo partially
+  installed hooks, and cover those failure paths with automated tests.
+
 ## 1.01 - 2026-08-29
 
 - Document that FFXI's Blur Effect must be enabled before game startup and that

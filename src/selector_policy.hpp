@@ -11,6 +11,23 @@ namespace spectralfix
         mismatch,
     };
 
+    constexpr bool candidate_context_is_trusted(
+        const bool deviceMatches,
+        const uint32_t stackHash)
+    {
+        return deviceMatches && stackHash != 0;
+    }
+
+    constexpr bool resource_marker_dimensions_valid(
+        const uint32_t originalSize,
+        const uint32_t actualSize,
+        const uint32_t expectedOriginalSize)
+    {
+        return expectedOriginalSize != 0
+            && originalSize == expectedOriginalSize
+            && actualSize >= originalSize;
+    }
+
     constexpr bool should_arm_ordinal_one_default(
         const bool selectorValid,
         const uint32_t candidateId,
@@ -58,4 +75,5 @@ namespace spectralfix
         return selectorValid && identityMatches
             && actualSize >= originalSize && originalSize != 0;
     }
+
 }
