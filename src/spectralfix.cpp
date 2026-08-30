@@ -2,9 +2,14 @@
 // Enlarges and corrects FFXI's client-owned actor-aura render path.
 
 #include "Ashita.h"
+#include "composite_state.hpp"
+#include "failure_policy.hpp"
 #include "geometry_rewrite.hpp"
+#include "hook_policy.hpp"
+#include "hook_transaction.hpp"
 #include "selector_policy.hpp"
 #include "selector_validation.hpp"
+#include "settings.hpp"
 #include "version.hpp"
 
 #include <Windows.h>
@@ -12,7 +17,7 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -22,25 +27,25 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace spectralfix
 {
+    // Target sizes, spread limits, and opacity defaults live in settings.hpp so the
+    // config round trip and the runtime share one definition of each.
     constexpr uint32_t kMarkerMagic       = 0x58465053; // "SPFX" in little endian.
     constexpr uint32_t kMarkerVersion     = 1;
     constexpr uint32_t kOriginalSize      = 256;
-    constexpr uint32_t kMediumTargetSize  = 1024;
-    constexpr uint32_t kDefaultTargetSize = 2048;
-    constexpr uint32_t kUltraTargetSize   = 4096;
     constexpr uint32_t kSpreadBase        = 1024;
-    constexpr float kMinManualSpread      = 1.0F;
-    constexpr float kMaxManualSpread      = 16.0F;
-    constexpr float kDefaultSpread        = 2.0F;
-    constexpr float kDefaultOpacityPercent = 100.0F;
-    constexpr float kDefaultCompositeOpacityPercent = 25.0F;
     constexpr uint32_t kCreateTextureSlot = 20;
     constexpr uint32_t kSetTextureSlot     = 61;
     constexpr uint32_t kDrawPrimitiveUPSlot = 72;
-    constexpr uint32_t kMaxHookRechains    = 3;
+
+    // Indices into the hook table. Install order is also the reverse of rollback order.
+    constexpr size_t kHookCreateTexture   = 0;
+    constexpr size_t kHookSetTexture      = 1;
+    constexpr size_t kHookDrawPrimitiveUP = 2;
+    constexpr size_t kHookCount           = 3;
     constexpr size_t kMaxSignatureEntries = 64;
     constexpr size_t kMaxActivityEntries  = 256;
     constexpr uint64_t kMaxLogBytes       = 4ULL * 1024ULL * 1024ULL;
@@ -116,12 +121,6 @@ namespace spectralfix
         bool firstSeenPending{false};
     };
 
-    struct StateValue
-    {
-        DWORD value{0};
-        bool valid{false};
-    };
-
     class Plugin;
 
     Plugin* gPlugin = nullptr;
@@ -133,14 +132,6 @@ namespace spectralfix
     thread_local bool gInsideDrawPrimitiveUP = false;
     bool gReleased = false;
 
-    static std::string lower_copy(std::string value)
-    {
-        std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        return value;
-    }
-
     static uint64_t file_size_or_zero(const std::string& path)
     {
         WIN32_FILE_ATTRIBUTE_DATA data{};
@@ -150,29 +141,6 @@ namespace spectralfix
         size.HighPart = data.nFileSizeHigh;
         size.LowPart = data.nFileSizeLow;
         return size.QuadPart;
-    }
-
-    static std::string trim_copy(std::string value)
-    {
-        const auto first = value.find_first_not_of(" \t\r\n");
-        if (first == std::string::npos)
-            return {};
-        const auto last = value.find_last_not_of(" \t\r\n");
-        return value.substr(first, last - first + 1);
-    }
-
-    static bool parse_float(const std::string& text, float& value)
-    {
-        try
-        {
-            size_t used = 0;
-            value       = std::stof(text, &used);
-            return used == text.size() && std::isfinite(value);
-        }
-        catch (...)
-        {
-            return false;
-        }
     }
 
     static uint32_t vertex_count(const D3DPRIMITIVETYPE type, const UINT primitiveCount)
@@ -193,7 +161,9 @@ namespace spectralfix
     {
         return size == sizeof(marker)
             && marker.magic == kMarkerMagic
-            && marker.version == kMarkerVersion;
+            && marker.version == kMarkerVersion
+            && resource_marker_dimensions_valid(
+                marker.originalSize, marker.actualSize, kOriginalSize);
     }
 
     class Plugin final : public IPlugin
@@ -242,7 +212,9 @@ namespace spectralfix
             ::CreateDirectoryA(logDir.c_str(), nullptr);
             logPath_    = logDir + "\\spectralfix.log";
             logArchivePath_ = logDir + "\\spectralfix.previous.log";
-            configPath_ = installPath_ + "config\\spectralfix.ini";
+            const auto configDir = installPath_ + "config";
+            ::CreateDirectoryA(configDir.c_str(), nullptr);
+            configPath_ = configDir + "\\spectralfix.ini";
 
             logBytesWritten_ = file_size_or_zero(logPath_);
             if (logBytesWritten_ >= kMaxLogBytes)
@@ -251,12 +223,22 @@ namespace spectralfix
                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
                     logBytesWritten_ = 0;
                 else
+                {
                     logRotationFailedThisRun_ = true;
+                    loggingDisabledAtLimit_   = true;
+                }
             }
 
-            log_.open(logPath_, std::ios::out | std::ios::app);
-            if (!log_.is_open())
-                return false;
+            // Diagnostics are not worth refusing the fix over. A log SpectralFix
+            // cannot open costs troubleshooting output and nothing else.
+            if (!loggingDisabledAtLimit_)
+                log_.open(logPath_, std::ios::out | std::ios::app);
+            loggingAvailable_ = log_.is_open();
+            if (loggingDisabledAtLimit_)
+                chat("SpectralFix could not rotate its full diagnostic log. File logging is disabled for this session; the fix remains active.");
+            else if (!loggingAvailable_)
+                chat("SpectralFix could not open its diagnostic log. The fix is still active, "
+                     "but troubleshooting output will not be recorded to file.");
 
             module_ = read_module_identity();
             signatureCounts_.reserve(kMaxSignatureEntries);
@@ -264,8 +246,6 @@ namespace spectralfix
             load_selector();
 
             log_line(std::string("=== SpectralFix v") + kVersionString + " initialized ===");
-            if (logRotationFailedThisRun_)
-                log_line("Log rotation failed; diagnostics will continue in the current file for this session.");
             log_line("Ashita install: " + installPath_);
             log_line(module_.valid
                 ? hex_line("FFXiMain identity", module_.timestamp, module_.size)
@@ -290,17 +270,52 @@ namespace spectralfix
             return true;
         }
 
+        bool release_refused() const { return releaseRefused_; }
+
         void Release() override
         {
-            enabled_ = false;
-            restore_hooks();
+            allowNewEnlargements_ = false;
+
+            // Ashita exposes IPluginManager::Unload and UnloadAll to every component,
+            // so Release can arrive mid-session through a route no command guard can
+            // intercept. Restoring the hooks then would strand a live enlarged
+            // allocation with nothing correcting the draws into it, which is the exact
+            // corruption this plugin exists to prevent. Keep the hooks, stay resident,
+            // and say so. At real client shutdown this costs nothing.
+            if (must_retain_hooks_on_release(hooksPublished_, enlargementPublished_))
+            {
+                releaseRefused_ = true;
+                gReleased       = true;
+                log_line("RELEASE REFUSED: an enlarged allocation is still live, so SpectralFix kept its D3D8 hooks and stayed resident. Draw correction continues, but Present callbacks stop, so no further status or settings updates are recorded.");
+                chat("SpectralFix cannot unload while its enlarged aura is live. Exit the entire client now; correction is being retained only to keep shutdown safe.");
+                log_status("release-refused");
+                return;
+            }
+
+            auraFeaturesEnabled_ = false;
+            if (!restore_hooks())
+            {
+                releaseRefused_ = true;
+                gReleased       = true;
+                log_line("RELEASE REFUSED: one or more D3D8 hooks could not be restored. SpectralFix stayed resident; immediate client exit is required.");
+                chat("SpectralFix could not safely finish unloading its D3D8 hooks. Exit the entire client now.");
+                log_status("release-refused-hook-rollback");
+                return;
+            }
             log_status("release");
             log_line("=== SpectralFix released ===");
-            if (log_.is_open())
-                log_.close();
             if (gPlugin == this)
                 gPlugin = nullptr;
-            gReleased = true;
+
+            // A startup that failed before publishing hooks left nothing behind, so
+            // it must not bar the plugin from loading again this session.
+            if (hooksPublished_)
+                gReleased = true;
+
+            std::unique_lock<std::mutex> lock(logMutex_);
+            loggingAvailable_ = false;
+            if (log_.is_open())
+                log_.close();
         }
 
         bool Direct3DInitialize(IDirect3DDevice8* device) override
@@ -343,8 +358,9 @@ namespace spectralfix
                     : configuredTargetSize_;
                 if (requestedTarget > maxTextureWidth_ || requestedTarget > maxTextureHeight_)
                 {
-                    targetUnsupported_ = true;
-                    enabled_ = false;
+                    targetUnsupported_    = true;
+                    allowNewEnlargements_ = false;
+                    auraFeaturesEnabled_  = false;
                     std::ostringstream warning;
                     warning << "TARGET UNSUPPORTED: requested " << requestedTarget << 'x'
                         << requestedTarget << " exceeds the D3D8 device limit; stock rendering retained.";
@@ -359,7 +375,8 @@ namespace spectralfix
 
             if (!pin_module())
             {
-                enabled_ = false;
+                allowNewEnlargements_ = false;
+                auraFeaturesEnabled_  = false;
                 log_line("Module pinning failed; D3D8 hooks were not installed and stock rendering was retained.");
                 chat("SpectralFix could not secure its hook lifetime. Stock rendering retained; restart the client.");
                 return false;
@@ -367,10 +384,21 @@ namespace spectralfix
 
             if (!install_hooks())
             {
-                log_line("D3D8 hook transaction failed; stock rendering retained.");
+                allowNewEnlargements_ = false;
+                auraFeaturesEnabled_  = false;
+                if (hookRollbackIncomplete_)
+                {
+                    log_line("D3D8 hook transaction failed and rollback was incomplete. No aura allocation was enlarged; SpectralFix retained accurate hook ownership and immediate client exit is required.");
+                    chat("SpectralFix could not safely roll back a D3D8 hook. Exit the entire client now.");
+                }
+                else
+                {
+                    log_line("D3D8 hook transaction failed and rolled back completely; stock rendering retained.");
+                }
                 return false;
             }
 
+            hooksPublished_ = true;
             log_line("Direct3DInitialize complete; wrapper-neutral CreateTexture, SetTexture observation, and DrawPrimitiveUP interception active.");
             chat("SpectralFix loaded. Use /spectralfix help for settings.");
             return true;
@@ -380,24 +408,16 @@ namespace spectralfix
         {
             ++frames_;
 
-            if ((frames_ % 60) == 0 && !hooks_intact())
+            if (pendingLogDisabledWarning_.exchange(false))
+                chat("SpectralFix file logging stopped after a rotation or write failure. The fix remains active; status counters are still available in game.");
+
+            if ((frames_ % 60) == 0)
             {
-                if (activate_native_stage_zero_query_mode())
-                {
-                    log_line("SetTexture observer released; native stage-zero query mode is active.");
-                }
-                else if (hookRechains_ < kMaxHookRechains && rechain_displaced_hooks())
-                {
-                    ++hookRechains_;
-                    log_line("D3D8 hook chain reacquired after startup displacement.");
-                }
-                else if (!hookDisplaced_)
-                {
-                    hookDisplaced_ = true;
-                    enabled_       = false;
-                    log_line("HOOK DISPLACED: SpectralFix could not safely re-chain a required D3D8 slot and disabled itself.");
-                    chat("SpectralFix disabled: a required D3D8 hook could not be safely reattached. Restart the client.");
-                }
+                const bool verdictWasPending = displacementVerdictPending_;
+                if (!hooks_intact())
+                    handle_hook_displacement();
+                if (verdictWasPending && displacementVerdictPending_)
+                    resolve_displacement_verdict();
             }
 
             if (pendingLearn_)
@@ -440,7 +460,7 @@ namespace spectralfix
                 log_line(saved
                     ? "SELECTOR MISMATCH: another allocation produced the aura activity. The override was saved; immediate full client exit is required."
                     : "SELECTOR MISMATCH: another allocation produced the aura activity, but the override could not be saved. Immediate full client exit is required.");
-                chat("WARNING: SpectralFix detected an unexpected aura allocation and disabled itself.");
+                chat("WARNING: SpectralFix detected an unexpected aura allocation and stopped adjusting it.");
                 chat(saved
                     ? "Exit the entire client now. The corrected allocation was saved and will apply after relaunch."
                     : "Exit the entire client now. SpectralFix could not save the corrected allocation; see spectralfix.log.");
@@ -468,21 +488,146 @@ namespace spectralfix
                     ? "First classified center composite omitted successfully."
                     : "First classified center composite opacity adjustment applied successfully.");
             }
+            if (compositeRestoreFailed_)
+            {
+                compositeRestoreFailed_ = false;
+                note_composite_state_failure();
+            }
             if (pendingCompositeStateFailure_)
             {
                 pendingCompositeStateFailure_ = false;
                 log_line("Center-composite state override or restoration failed; composite adjustment was disabled for this session.");
                 chat("Center-composite opacity disabled after a Direct3D state failure; stock composite retained.");
             }
-            if (pendingFirstFailure_)
+            if (drawExceptionNotice_.consume())
+                log_line("DrawPrimitiveUP interception raised an exception; the original draw was preserved.");
+            if (setTextureExceptionNotice_.consume())
+                log_line("SetTexture observation raised an exception; stage-zero aura tracking was cleared.");
+            if (drawFailureNotice_.consume())
             {
-                pendingFirstFailure_ = false;
                 log_line("A corrected DrawPrimitiveUP submission failed; the original stock draw was allowed through.");
-                chat("SpectralFix draw correction failed and fell back to the original draw. See spectralfix.log.");
+                chat("SpectralFix draw correction failed and fell back to the original draw. Run /spectralfix status; diagnostic details are logged when available.");
             }
 
             if ((frames_ % 600) == 0)
                 log_status("periodic");
+        }
+
+        bool slot_is_ours(const size_t index) const
+        {
+            const auto& slot = hooks_[index];
+            return slot.tracked && slot.target != nullptr && *slot.target == slot.hook;
+        }
+
+        // Stage-zero identity comes either from our SetTexture observer or, in native
+        // query mode, from asking the device directly. With neither, trackedStageZero*
+        // freezes at whatever was last seen, so anything keyed off it would be acting
+        // on stale identity.
+        bool stage_zero_tracking_trustworthy() const
+        {
+            return nativeStageZeroQueryMode_ || slot_is_ours(kHookSetTexture);
+        }
+
+        void handle_hook_displacement()
+        {
+            if (activate_native_stage_zero_query_mode())
+            {
+                log_line("SetTexture observer released; native stage-zero query mode is active.");
+                return;
+            }
+            if (hookDisplaced_)
+            {
+                if (enlargementPublished_ && !correctionLost_
+                    && !slot_is_ours(kHookDrawPrimitiveUP)
+                    && !displacementVerdictPending_)
+                {
+                    displacementVerdictPending_ = true;
+                    interceptedAtDisplacement_  = interceptedDraws_;
+                }
+                return;
+            }
+
+            hookDisplaced_        = true;
+            allowNewEnlargements_ = false;
+            log_displaced_hooks();
+
+            // Tap and center-composite correction key off stage-zero identity. Once
+            // that identity can go stale, they could adjust an unrelated draw, so they
+            // stop here. Downsample correction of a marked target does not depend on
+            // stage-zero tracking and deliberately continues.
+            if (!stage_zero_tracking_trustworthy())
+            {
+                auraFeaturesEnabled_  = false;
+                trackedStageZeroAura_ = false;
+                trackedStageZeroSize_ = 0;
+                log_line("Stage-zero tracking is no longer trustworthy; tap and center-composite correction stopped to avoid adjusting unrelated draws.");
+            }
+
+            if (!enlargementPublished_)
+            {
+                log_line("HOOK DISPLACED: another component owns a required D3D8 slot. SpectralFix left that owner in place. Nothing had been enlarged, so stock rendering is retained.");
+                chat("SpectralFix hit a Direct3D hook conflict before it changed anything. Stock rendering retained; restart the client.");
+                return;
+            }
+
+            if (slot_is_ours(kHookDrawPrimitiveUP))
+            {
+                drawChainSurvivalReported_ = true;
+                log_line("HOOK DISPLACED: the DrawPrimitiveUP slot is still owned by SpectralFix, so correction of the live enlarged allocation continues.");
+                chat("SpectralFix hit a Direct3D hook conflict. The current aura remains corrected; restart the client when convenient.");
+                return;
+            }
+
+            // Whether correction survives depends on whether anything still calls our
+            // DrawPrimitiveUP hook. Draws counted before this moment prove nothing.
+            // Keep sampling while a foreign hook owns the slot: a later chain change
+            // must not silently strand the allocation after one successful sample.
+            displacementVerdictPending_ = true;
+            interceptedAtDisplacement_  = interceptedDraws_;
+            log_line("HOOK DISPLACED: another component owns a required D3D8 slot. SpectralFix left that owner in place; no further allocations will be enlarged, and draw-chain forwarding is being monitored.");
+        }
+
+        void resolve_displacement_verdict()
+        {
+            const auto sample = evaluate_draw_chain_sample(
+                slot_is_ours(kHookDrawPrimitiveUP),
+                interceptedDraws_,
+                interceptedAtDisplacement_,
+                missedDrawChainWindows_,
+                kDrawChainMissThreshold);
+            missedDrawChainWindows_ = sample.consecutiveMisses;
+
+            if (sample.health == DrawChainHealth::owned)
+            {
+                displacementVerdictPending_ = false;
+                return;
+            }
+            if (sample.health == DrawChainHealth::active)
+            {
+                if (!drawChainSurvivalReported_)
+                {
+                    drawChainSurvivalReported_ = true;
+                    log_line("HOOK DISPLACED: SpectralFix is still in the draw chain; correction of the live enlarged allocation continues under continuous monitoring.");
+                    chat("SpectralFix hit a Direct3D hook conflict. The current aura keeps rendering correctly; restart the client when convenient.");
+                }
+                interceptedAtDisplacement_ = interceptedDraws_;
+                return;
+            }
+            if (sample.health == DrawChainHealth::inconclusive)
+            {
+                interceptedAtDisplacement_ = interceptedDraws_;
+                return;
+            }
+
+            displacementVerdictPending_ = false;
+
+            // The worst case: something is enlarged and SpectralFix can no longer
+            // correct the draws into it. Say so plainly instead of leaving the user to
+            // wonder why the aura looks wrong.
+            correctionLost_ = true;
+            log_line("HOOK DISPLACED: SpectralFix received no DrawPrimitiveUP calls for three consecutive monitoring windows and can no longer confirm correction of the allocation it already enlarged. The aura may render incorrectly until the client is restarted.");
+            chat("SpectralFix can no longer confirm that its Direct3D draw hook is active.");
+            chat("Exit the entire client now; the enlarged aura may render incorrectly until you do.");
         }
 
         HRESULT handle_draw_primitive_up(
@@ -494,11 +639,18 @@ namespace spectralfix
             const UINT stride)
         {
             ++interceptedDraws_;
-            if (!enabled_ || device_ == nullptr || device != device_ || original == nullptr
+            if (device_ == nullptr || device != device_ || original == nullptr
                 || vertexData == nullptr)
                 return original != nullptr
                     ? original(device, primitiveType, primitiveCount, vertexData, stride)
                     : D3DERR_INVALIDCALL;
+
+            // Once an allocation has been enlarged, its downsample geometry has to
+            // keep being corrected for as long as the client draws into it, whatever
+            // else has been switched off. SpectralFix goes fully inert only when it
+            // never published an enlargement in the first place.
+            if (!enlargementPublished_ && !auraFeaturesEnabled_)
+                return original(device, primitiveType, primitiveCount, vertexData, stride);
 
             const auto count = vertex_count(primitiveType, primitiveCount);
             const bool supportedAuraShape = primitiveType == D3DPT_TRIANGLESTRIP
@@ -557,7 +709,8 @@ namespace spectralfix
                         else if (decision == SelectorActivityDecision::mismatch)
                         {
                             selectorMismatch_               = true;
-                            enabled_                        = false;
+                            allowNewEnlargements_           = false;
+                            auraFeaturesEnabled_            = false;
                             pendingMismatchMarker_          = targetMarker;
                             pendingSelectorMismatchWarning_ = true;
                         }
@@ -583,8 +736,7 @@ namespace spectralfix
                                 pendingFirstScale_ = true;
                             return hr;
                         }
-                        ++drawFailures_;
-                        pendingFirstFailure_ = true;
+                        note_draw_submission_failure();
                     }
                 }
             }
@@ -592,6 +744,9 @@ namespace spectralfix
             {
                 ++unmarkedBlurDraws_;
             }
+
+            if (!auraFeaturesEnabled_)
+                return original(device, primitiveType, primitiveCount, vertexData, stride);
 
             auto stageZeroSize = trackedStageZeroSize_;
             auto stageZeroAura = trackedStageZeroAura_;
@@ -658,8 +813,7 @@ namespace spectralfix
                         }
                         return hr;
                     }
-                    ++drawFailures_;
-                    pendingFirstFailure_ = true;
+                    note_draw_submission_failure();
                 }
             }
 
@@ -817,6 +971,7 @@ namespace spectralfix
         }
 
         CreatePlan before_create(
+            IDirect3DDevice8* device,
             const UINT width,
             const UINT height,
             const UINT levels,
@@ -831,18 +986,26 @@ namespace spectralfix
             plan.actualWidth     = width;
             plan.actualHeight    = height;
 
-            plan.candidate = width == kOriginalSize
+            const bool candidateShape = width == kOriginalSize
                 && height == kOriginalSize
                 && levels == 1
                 && (usage & D3DUSAGE_RENDERTARGET) != 0
                 && format == D3DFMT_A8R8G8B8
                 && pool == D3DPOOL_DEFAULT;
-            if (!plan.candidate)
+            if (!candidateShape)
                 return plan;
 
-            plan.candidateId = ++candidateCount_;
             plan.callerRva   = address_rva(caller);
             plan.stackHash   = capture_stack_hash();
+            const bool deviceMatches = device_ != nullptr && device == device_;
+            if (!candidate_context_is_trusted(deviceMatches, plan.stackHash))
+            {
+                ++candidateContextRejections_;
+                return plan;
+            }
+
+            plan.candidate   = true;
+            plan.candidateId = ++candidateCount_;
             const uint64_t signature = (static_cast<uint64_t>(plan.callerRva) << 32) | plan.stackHash;
             auto signatureIt = signatureCounts_.find(signature);
             if (signatureIt == signatureCounts_.end())
@@ -874,7 +1037,7 @@ namespace spectralfix
                 log_line("Ordinal-1 startup default armed for candidate 1; awaiting aura-activity verification.");
             }
 
-            if (enabled_ && selector_.valid
+            if (allowNewEnlargements_ && selector_.valid
                 && selector_.moduleTimestamp == module_.timestamp
                 && selector_.moduleSize == module_.size
                 && selector_.callerRva == plan.callerRva
@@ -950,6 +1113,7 @@ namespace spectralfix
                 out << " RESIZED";
             log_line(out.str());
 
+            // enlargementPublished_ is set by the hook before this function runs.
             if (plan.resize && !fellBack && SUCCEEDED(finalResult))
                 ++resizedAllocations_;
         }
@@ -974,7 +1138,7 @@ namespace spectralfix
             if (SUCCEEDED(markerResult) && marker_valid(marker, markerSize)
                 && selected_aura_marker_is_trackable(
                     selector_.valid, marker_matches_selector(marker),
-                    marker.actualSize, kOriginalSize))
+                    marker.actualSize, marker.originalSize))
             {
                 trackedStageZeroSize_ = marker.actualSize;
                 trackedStageZeroAura_ = true;
@@ -1025,7 +1189,7 @@ namespace spectralfix
             if (SUCCEEDED(markerResult) && marker_valid(marker, markerSize)
                 && selected_aura_marker_is_trackable(
                     selector_.valid, marker_matches_selector(marker),
-                    marker.actualSize, kOriginalSize))
+                    marker.actualSize, marker.originalSize))
             {
                 result = marker.actualSize;
                 ++textureMarkerHits_;
@@ -1073,7 +1237,8 @@ namespace spectralfix
             CreatePlan plan{};
             try
             {
-                plan = plugin->before_create(width, height, levels, usage, format, pool, _ReturnAddress());
+                plan = plugin->before_create(
+                    device, width, height, levels, usage, format, pool, _ReturnAddress());
             }
             catch (...)
             {
@@ -1099,6 +1264,13 @@ namespace spectralfix
                 finalResult = original(device, width, height, levels, usage, format, pool, output);
                 fellBack    = true;
             }
+
+            // Record the enlargement before any fallible bookkeeping runs. The build
+            // uses /EHa, so an access violation inside after_create is swallowed by the
+            // catch below; a live enlarged allocation the plugin has forgotten about is
+            // the one state it must never be in.
+            if (plan.resize && !fellBack && SUCCEEDED(finalResult))
+                plugin->note_enlargement_published();
 
             try
             {
@@ -1176,17 +1348,26 @@ namespace spectralfix
             return result;
         }
 
+        void note_enlargement_published()
+        {
+            enlargementPublished_ = true;
+        }
+
         void note_create_exception()
         {
             ++callbackFailures_;
-            log_line("CreateTexture post-processing raised an exception; the original D3D result was preserved.");
+            if (!createExceptionReported_)
+            {
+                createExceptionReported_ = true;
+                log_line("CreateTexture post-processing raised an exception; the original D3D result was preserved.");
+            }
         }
 
         void note_draw_exception()
         {
             ++callbackFailures_;
-            pendingFirstFailure_ = true;
-            log_line("DrawPrimitiveUP interception raised an exception; the original draw was preserved.");
+            drawExceptionNotice_.record();
+            drawFailureNotice_.record();
         }
 
         void note_set_texture_exception()
@@ -1194,18 +1375,30 @@ namespace spectralfix
             trackedStageZeroSize_ = 0;
             trackedStageZeroAura_ = false;
             ++callbackFailures_;
-            log_line("SetTexture observation raised an exception; stage-zero aura tracking was cleared.");
+            setTextureExceptionNotice_.record();
+        }
+
+        void note_draw_submission_failure()
+        {
+            ++drawFailures_;
+            drawFailureNotice_.record();
         }
 
     private:
         IAshitaCore* core_{nullptr};
         IDirect3DDevice8* device_{nullptr};
-        void** createHookSlot_{nullptr};
-        void* createHookPrevious_{nullptr};
-        void** setTextureHookSlot_{nullptr};
-        void* setTextureHookPrevious_{nullptr};
-        void** drawHookSlot_{nullptr};
-        void* drawHookPrevious_{nullptr};
+        // One record per hooked vtable slot keeps installation, ownership checks,
+        // rollback, and restoration on the same source of truth.
+        struct HookSlot
+        {
+            const char* name{nullptr};
+            uint32_t vtableIndex{0};
+            void* hook{nullptr};    // SpectralFix's replacement function.
+            void** target{nullptr}; // Address of the slot; null when not installed.
+            void* previous{nullptr};
+            bool tracked{false};    // False once the slot is deliberately handed back.
+        };
+        std::array<HookSlot, kHookCount> hooks_{};
 
         ModuleIdentity module_{};
         Selector selector_{};
@@ -1217,19 +1410,36 @@ namespace spectralfix
         std::mutex logMutex_{};
         uint64_t logBytesWritten_{0};
         bool logRotationFailedThisRun_{false};
+        bool loggingDisabledAtLimit_{false};
         std::unordered_map<uint64_t, uint32_t> signatureCounts_{};
         std::unordered_map<uint32_t, CandidateActivity> activity_{};
         std::array<uint8_t, kMaxVertices * kMaxStride> scratch_{};
 
-        bool enabled_{true};
+        // Correcting an allocation SpectralFix already enlarged has to outlive every
+        // optional feature: passing those draws through untouched is exactly what
+        // puts an oversized copy on screen.
+        bool allowNewEnlargements_{true};
+        bool auraFeaturesEnabled_{true};
+        bool enlargementPublished_{false};
+        bool hooksPublished_{false};
+        std::atomic<bool> loggingAvailable_{false};
+        std::atomic<bool> pendingLogDisabledWarning_{false};
+        bool compositeRestoreFailed_{false};
         bool hookDisplaced_{false};
+        bool correctionLost_{false};
+        bool releaseRefused_{false};
+        bool displacementVerdictPending_{false};
+        bool drawChainSurvivalReported_{false};
+        uint64_t interceptedAtDisplacement_{0};
+        uint32_t missedDrawChainWindows_{0};
         bool targetUnsupported_{false};
         bool targetCapsKnown_{false};
         bool modulePinned_{false};
         uint32_t maxTextureWidth_{0};
         uint32_t maxTextureHeight_{0};
         bool nativeStageZeroQueryMode_{false};
-        uint32_t hookRechains_{0};
+        bool hookRollbackIncomplete_{false};
+        bool createExceptionReported_{false};
         bool selectorLearnedThisRun_{false};
         bool selectorLoadedFromConfig_{false};
         bool selectorFromOrdinalDefault_{false};
@@ -1246,7 +1456,9 @@ namespace spectralfix
         bool pendingFirstOpacity_{false};
         bool pendingFirstComposite_{false};
         bool pendingCompositeStateFailure_{false};
-        bool pendingFirstFailure_{false};
+        OneShotNotice drawFailureNotice_{};
+        OneShotNotice drawExceptionNotice_{};
+        OneShotNotice setTextureExceptionNotice_{};
         ResourceMarker pendingMarker_{};
         ResourceMarker pendingCandidateMarker_{};
         ResourceMarker pendingMismatchMarker_{};
@@ -1255,6 +1467,7 @@ namespace spectralfix
         uint32_t candidateCount_{0};
         uint64_t signatureTrackingDrops_{0};
         uint64_t activityTrackingDrops_{0};
+        uint64_t candidateContextRejections_{0};
         uint32_t resizedAllocations_{0};
         uint32_t trackedStageZeroSize_{0};
         bool trackedStageZeroAura_{false};
@@ -1288,30 +1501,6 @@ namespace spectralfix
         bool compositeAdjustmentDisabledThisSession_{false};
         float lastEffectiveSpread_{1.0F};
         uint32_t configuredTargetSize_{kDefaultTargetSize};
-
-        static StateValue read_render_state(
-            IDirect3DDevice8* device,
-            const D3DRENDERSTATETYPE state)
-        {
-            StateValue result{};
-            result.valid = device != nullptr && SUCCEEDED(device->GetRenderState(state, &result.value));
-            return result;
-        }
-
-        static StateValue read_texture_state(
-            IDirect3DDevice8* device,
-            const D3DTEXTURESTAGESTATETYPE state)
-        {
-            StateValue result{};
-            result.valid = device != nullptr
-                && SUCCEEDED(device->GetTextureStageState(0, state, &result.value));
-            return result;
-        }
-
-        static bool state_is(const StateValue& state, const DWORD expected)
-        {
-            return state.valid && state.value == expected;
-        }
 
         bool center_composite_state_matches(IDirect3DDevice8* device) const
         {
@@ -1360,55 +1549,22 @@ namespace spectralfix
                     scratch_.data(), scratch_.size()))
                 return false;
 
-            const auto alphaBlend = read_render_state(device, D3DRS_ALPHABLENDENABLE);
-            const auto srcBlend = read_render_state(device, D3DRS_SRCBLEND);
-            const auto dstBlend = read_render_state(device, D3DRS_DESTBLEND);
-            const auto blendOp = read_render_state(device, D3DRS_BLENDOP);
-            const auto alphaTest = read_render_state(device, D3DRS_ALPHATESTENABLE);
-            const auto alphaOp = read_texture_state(device, D3DTSS_ALPHAOP);
-            const auto alphaArg1 = read_texture_state(device, D3DTSS_ALPHAARG1);
-            const auto alphaArg2 = read_texture_state(device, D3DTSS_ALPHAARG2);
-            if (!alphaBlend.valid || !srcBlend.valid || !dstBlend.valid || !blendOp.valid
-                || !alphaTest.valid || !alphaOp.valid || !alphaArg1.valid || !alphaArg2.valid)
+            CompositeStateScope scope(device, &compositeRestoreFailed_);
+            if (!scope.captured())
             {
                 note_composite_state_failure();
                 return false;
             }
-
-            const auto restore = [&]() {
-                bool restored = true;
-                restored = SUCCEEDED(device->SetTextureStageState(0, D3DTSS_ALPHAARG2, alphaArg2.value)) && restored;
-                restored = SUCCEEDED(device->SetTextureStageState(0, D3DTSS_ALPHAARG1, alphaArg1.value)) && restored;
-                restored = SUCCEEDED(device->SetTextureStageState(0, D3DTSS_ALPHAOP, alphaOp.value)) && restored;
-                restored = SUCCEEDED(device->SetRenderState(D3DRS_ALPHATESTENABLE, alphaTest.value)) && restored;
-                restored = SUCCEEDED(device->SetRenderState(D3DRS_BLENDOP, blendOp.value)) && restored;
-                restored = SUCCEEDED(device->SetRenderState(D3DRS_DESTBLEND, dstBlend.value)) && restored;
-                restored = SUCCEEDED(device->SetRenderState(D3DRS_SRCBLEND, srcBlend.value)) && restored;
-                restored = SUCCEEDED(device->SetRenderState(D3DRS_ALPHABLENDENABLE, alphaBlend.value)) && restored;
-                return restored;
-            };
-
-            bool configured = true;
-            configured = SUCCEEDED(device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE)) && configured;
-            configured = SUCCEEDED(device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA)) && configured;
-            configured = SUCCEEDED(device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA)) && configured;
-            configured = SUCCEEDED(device->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD)) && configured;
-            configured = SUCCEEDED(device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE)) && configured;
-            configured = SUCCEEDED(device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE)) && configured;
-            configured = SUCCEEDED(device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE)) && configured;
-            configured = SUCCEEDED(device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE)) && configured;
-
-            if (!configured)
+            if (!scope.apply())
             {
-                restore();
+                scope.restore();
                 note_composite_state_failure();
                 return false;
             }
 
             const auto drawResult = original(
                 device, primitiveType, primitiveCount, scratch_.data(), stride);
-            const bool restored = restore();
-            if (!restored)
+            if (!scope.restore())
             {
                 note_composite_state_failure();
                 result = drawResult;
@@ -1416,8 +1572,7 @@ namespace spectralfix
             }
             if (FAILED(drawResult))
             {
-                ++drawFailures_;
-                pendingFirstFailure_ = true;
+                note_draw_submission_failure();
                 return false;
             }
 
@@ -1475,97 +1630,133 @@ namespace spectralfix
             return length == 0 ? "<path unavailable>" : std::string(path.data(), length);
         }
 
+        static void publish_original(const size_t index, void* value)
+        {
+            switch (index)
+            {
+                case kHookCreateTexture:
+                    gOriginalCreateTexture = reinterpret_cast<CreateTextureFn>(value);
+                    break;
+                case kHookSetTexture:
+                    gOriginalSetTexture = reinterpret_cast<SetTextureFn>(value);
+                    break;
+                default:
+                    gOriginalDrawPrimitiveUP = reinterpret_cast<DrawPrimitiveUPFn>(value);
+                    break;
+            }
+        }
+
+        void reset_hook_table()
+        {
+            hooks_[kHookCreateTexture] = HookSlot{
+                "CreateTexture", kCreateTextureSlot,
+                reinterpret_cast<void*>(&hook_create_texture), nullptr, nullptr, false};
+            hooks_[kHookSetTexture] = HookSlot{
+                "SetTexture", kSetTextureSlot,
+                reinterpret_cast<void*>(&hook_set_texture), nullptr, nullptr, false};
+            hooks_[kHookDrawPrimitiveUP] = HookSlot{
+                "DrawPrimitiveUP", kDrawPrimitiveUPSlot,
+                reinterpret_cast<void*>(&hook_draw_primitive_up), nullptr, nullptr, false};
+        }
+
+        void forget_hook_table()
+        {
+            for (auto& slot : hooks_)
+            {
+                slot.target   = nullptr;
+                slot.previous = nullptr;
+                slot.tracked  = false;
+            }
+        }
+
+        // Current view of every slot, for the pure policy helpers in hook_policy.hpp.
+        // `observed` carries the same values as writable pointers.
+        void observe_hooks(
+            std::array<HookSlotView, kHookCount>& views,
+            std::array<void*, kHookCount>& observed) const
+        {
+            for (size_t i = 0; i < kHookCount; ++i)
+            {
+                const auto& slot = hooks_[i];
+                const bool tracked = slot.tracked && slot.target != nullptr;
+                observed[i]      = tracked ? *slot.target : nullptr;
+                views[i].ours    = slot.hook;
+                views[i].current = observed[i];
+                views[i].tracked = tracked;
+            }
+        }
+
+        void log_hook_installed(const HookSlot& slot)
+        {
+            std::ostringstream out;
+            out << slot.name << " hook installed: slot=0x" << std::hex << std::uppercase
+                << reinterpret_cast<uintptr_t>(slot.target) << " original=0x"
+                << reinterpret_cast<uintptr_t>(slot.previous) << " hook=0x"
+                << reinterpret_cast<uintptr_t>(slot.hook) << std::dec
+                << " owner=" << module_path_for_address(slot.previous);
+            log_line(out.str());
+        }
+
         bool install_hooks()
         {
             auto*** object = reinterpret_cast<void***>(device_);
             if (object == nullptr || *object == nullptr)
                 return false;
 
-            createHookSlot_     = &(*object)[kCreateTextureSlot];
-            createHookPrevious_ = *createHookSlot_;
-            setTextureHookSlot_     = &(*object)[kSetTextureSlot];
-            setTextureHookPrevious_ = *setTextureHookSlot_;
-            drawHookSlot_       = &(*object)[kDrawPrimitiveUPSlot];
-            drawHookPrevious_   = *drawHookSlot_;
-            if (createHookPrevious_ == nullptr || setTextureHookPrevious_ == nullptr
-                || drawHookPrevious_ == nullptr
-                || createHookPrevious_ == reinterpret_cast<void*>(&hook_create_texture)
-                || setTextureHookPrevious_ == reinterpret_cast<void*>(&hook_set_texture)
-                || drawHookPrevious_ == reinterpret_cast<void*>(&hook_draw_primitive_up))
+            reset_hook_table();
+
+            // Capture and validate every slot before writing any of them.
+            for (auto& slot : hooks_)
             {
-                createHookSlot_     = nullptr;
-                setTextureHookSlot_ = nullptr;
-                drawHookSlot_       = nullptr;
+                slot.target   = &(*object)[slot.vtableIndex];
+                slot.previous = *slot.target;
+                if (slot.previous == nullptr || slot.previous == slot.hook)
+                {
+                    forget_hook_table();
+                    return false;
+                }
+            }
+            for (size_t i = 0; i < kHookCount; ++i)
+                publish_original(i, hooks_[i].previous);
+
+            const auto result = install_hook_transaction(
+                hooks_.data(), hooks_.size(),
+                [this](void** target, void* value)
+                {
+                    return write_hook_slot(target, value);
+                });
+            if (result != HookTransactionResult::installed)
+            {
+                if (result == HookTransactionResult::rollbackIncomplete)
+                {
+                    hookRollbackIncomplete_ = true;
+                    hooksPublished_         = true;
+                    for (const auto& slot : hooks_)
+                    {
+                        if (slot.tracked && slot.target != nullptr)
+                            log_line(std::string(slot.name) + " hook remained published after rollback failure.");
+                    }
+                }
+                else
+                {
+                    forget_hook_table();
+                }
                 return false;
             }
 
-            gOriginalCreateTexture  = reinterpret_cast<CreateTextureFn>(createHookPrevious_);
-            gOriginalSetTexture = reinterpret_cast<SetTextureFn>(setTextureHookPrevious_);
-            gOriginalDrawPrimitiveUP = reinterpret_cast<DrawPrimitiveUPFn>(drawHookPrevious_);
-
-            if (!write_hook_slot(createHookSlot_, reinterpret_cast<void*>(&hook_create_texture)))
-            {
-                createHookSlot_     = nullptr;
-                setTextureHookSlot_ = nullptr;
-                drawHookSlot_       = nullptr;
-                return false;
-            }
-            if (!write_hook_slot(setTextureHookSlot_, reinterpret_cast<void*>(&hook_set_texture)))
-            {
-                if (*createHookSlot_ == reinterpret_cast<void*>(&hook_create_texture))
-                    write_hook_slot(createHookSlot_, createHookPrevious_);
-                createHookSlot_     = nullptr;
-                setTextureHookSlot_ = nullptr;
-                drawHookSlot_       = nullptr;
-                return false;
-            }
-            if (!write_hook_slot(drawHookSlot_, reinterpret_cast<void*>(&hook_draw_primitive_up)))
-            {
-                if (*setTextureHookSlot_ == reinterpret_cast<void*>(&hook_set_texture))
-                    write_hook_slot(setTextureHookSlot_, setTextureHookPrevious_);
-                if (*createHookSlot_ == reinterpret_cast<void*>(&hook_create_texture))
-                    write_hook_slot(createHookSlot_, createHookPrevious_);
-                createHookSlot_     = nullptr;
-                setTextureHookSlot_ = nullptr;
-                drawHookSlot_       = nullptr;
-                return false;
-            }
-
-            std::ostringstream out;
-            out << "CreateTexture hook installed: slot=0x" << std::hex << std::uppercase
-                << reinterpret_cast<uintptr_t>(createHookSlot_) << " original=0x"
-                << reinterpret_cast<uintptr_t>(createHookPrevious_) << " hook=0x"
-                << reinterpret_cast<uintptr_t>(&hook_create_texture) << std::dec
-                << " owner=" << module_path_for_address(createHookPrevious_);
-            log_line(out.str());
-            out.str("");
-            out.clear();
-            out << "SetTexture observer installed: slot=0x" << std::hex << std::uppercase
-                << reinterpret_cast<uintptr_t>(setTextureHookSlot_) << " original=0x"
-                << reinterpret_cast<uintptr_t>(setTextureHookPrevious_) << " hook=0x"
-                << reinterpret_cast<uintptr_t>(&hook_set_texture) << std::dec
-                << " owner=" << module_path_for_address(setTextureHookPrevious_);
-            log_line(out.str());
-            out.str("");
-            out.clear();
-            out << "DrawPrimitiveUP hook installed: slot=0x" << std::hex << std::uppercase
-                << reinterpret_cast<uintptr_t>(drawHookSlot_) << " original=0x"
-                << reinterpret_cast<uintptr_t>(drawHookPrevious_) << " hook=0x"
-                << reinterpret_cast<uintptr_t>(&hook_draw_primitive_up) << std::dec
-                << " owner=" << module_path_for_address(drawHookPrevious_);
-            log_line(out.str());
+            for (const auto& slot : hooks_)
+                log_hook_installed(slot);
             return true;
         }
 
         bool hooks_intact() const
         {
-            return createHookSlot_ != nullptr
-                && drawHookSlot_ != nullptr
-                && *createHookSlot_ == reinterpret_cast<void*>(&hook_create_texture)
-                && (nativeStageZeroQueryMode_
-                    || (setTextureHookSlot_ != nullptr
-                        && *setTextureHookSlot_ == reinterpret_cast<void*>(&hook_set_texture)))
-                && *drawHookSlot_ == reinterpret_cast<void*>(&hook_draw_primitive_up);
+            if (!hooksPublished_)
+                return true;
+            std::array<HookSlotView, kHookCount> views{};
+            std::array<void*, kHookCount> observed{};
+            observe_hooks(views, observed);
+            return tracked_hooks_intact(views.data(), views.size());
         }
 
         void log_displaced_slot(const char* name, void** slot, void* expected, void* current)
@@ -1581,162 +1772,97 @@ namespace spectralfix
             log_line(out.str());
         }
 
+        void log_displaced_hooks()
+        {
+            for (const auto& slot : hooks_)
+            {
+                const auto current = slot.tracked && slot.target != nullptr
+                    ? *slot.target
+                    : nullptr;
+                const HookSlotView view{slot.hook, current, slot.tracked && slot.target != nullptr};
+                if (slot_is_displaced(view))
+                    log_displaced_slot(slot.name, slot.target, slot.hook, current);
+            }
+        }
+
+        // Native Windows D3D8 restores its own SetTexture pointer repeatedly. Hand
+        // the slot back and switch to querying stage zero on demand instead. The
+        // slot is marked untracked, so later ownership checks deliberately skip it.
         bool activate_native_stage_zero_query_mode()
         {
-            if (nativeStageZeroQueryMode_
-                || createHookSlot_ == nullptr
-                || setTextureHookSlot_ == nullptr
-                || drawHookSlot_ == nullptr
-                || *createHookSlot_ != reinterpret_cast<void*>(&hook_create_texture)
-                || *drawHookSlot_ != reinterpret_cast<void*>(&hook_draw_primitive_up))
+            if (nativeStageZeroQueryMode_)
                 return false;
 
-            auto* const setTextureHook = reinterpret_cast<void*>(&hook_set_texture);
-            void* const currentSetTexture = *setTextureHookSlot_;
-            if (currentSetTexture == nullptr || currentSetTexture == setTextureHook)
+            auto& setTexture = hooks_[kHookSetTexture];
+            if (!setTexture.tracked || setTexture.target == nullptr)
+                return false;
+            for (size_t i = 0; i < kHookCount; ++i)
+            {
+                if (i == kHookSetTexture)
+                    continue;
+                const auto& slot = hooks_[i];
+                if (!slot.tracked || slot.target == nullptr || *slot.target != slot.hook)
+                    return false;
+            }
+
+            void* const current = *setTexture.target;
+            if (current == nullptr || current == setTexture.hook)
                 return false;
 
-            const auto owner = lower_copy(module_path_for_address(currentSetTexture));
+            const auto owner = lower_copy(module_path_for_address(current));
             const bool isWindowsD3D8 = owner.find("\\windows\\system32\\d3d8.dll") != std::string::npos
                 || owner.find("\\windows\\syswow64\\d3d8.dll") != std::string::npos;
             if (!isWindowsD3D8)
                 return false;
 
-            log_displaced_slot("SetTexture", setTextureHookSlot_, setTextureHook, currentSetTexture);
-            setTextureHookPrevious_ = currentSetTexture;
-            gOriginalSetTexture = reinterpret_cast<SetTextureFn>(currentSetTexture);
-            setTextureHookSlot_ = nullptr;
-            trackedStageZeroSize_ = 0;
+            log_displaced_slot(setTexture.name, setTexture.target, setTexture.hook, current);
+            setTexture.previous = current;
+            publish_original(kHookSetTexture, current);
+            setTexture.tracked = false;
+            setTexture.target  = nullptr;
+            trackedStageZeroSize_     = 0;
+            trackedStageZeroAura_     = false;
             nativeStageZeroQueryMode_ = true;
             return true;
         }
 
-        bool rechain_displaced_hooks()
+        bool restore_hooks()
         {
-            if (createHookSlot_ == nullptr || setTextureHookSlot_ == nullptr || drawHookSlot_ == nullptr)
-                return false;
-
-            auto* const createHook = reinterpret_cast<void*>(&hook_create_texture);
-            auto* const setTextureHook = reinterpret_cast<void*>(&hook_set_texture);
-            auto* const drawHook = reinterpret_cast<void*>(&hook_draw_primitive_up);
-            void* const currentCreate = *createHookSlot_;
-            void* const currentSetTexture = *setTextureHookSlot_;
-            void* const currentDraw = *drawHookSlot_;
-
-            log_displaced_slot("CreateTexture", createHookSlot_, createHook, currentCreate);
-            log_displaced_slot("SetTexture", setTextureHookSlot_, setTextureHook, currentSetTexture);
-            log_displaced_slot("DrawPrimitiveUP", drawHookSlot_, drawHook, currentDraw);
-
-            const auto invalidTarget = [createHook, setTextureHook, drawHook](void* current, void* expected) {
-                return current == nullptr
-                    || (current != expected
-                        && (current == createHook || current == setTextureHook || current == drawHook));
-            };
-            if (invalidTarget(currentCreate, createHook)
-                || invalidTarget(currentSetTexture, setTextureHook)
-                || invalidTarget(currentDraw, drawHook))
+            bool restored = true;
+            for (size_t i = kHookCount; i > 0; --i)
             {
-                log_line("Hook re-chain refused: a replacement target was null or pointed at a mismatched SpectralFix hook.");
-                return false;
-            }
-
-            void* const oldCreatePrevious = createHookPrevious_;
-            void* const oldSetTexturePrevious = setTextureHookPrevious_;
-            void* const oldDrawPrevious = drawHookPrevious_;
-            const bool replaceCreate = currentCreate != createHook;
-            const bool replaceSetTexture = currentSetTexture != setTextureHook;
-            const bool replaceDraw = currentDraw != drawHook;
-
-            if (replaceCreate)
-            {
-                createHookPrevious_ = currentCreate;
-                gOriginalCreateTexture = reinterpret_cast<CreateTextureFn>(currentCreate);
-            }
-            if (replaceSetTexture)
-            {
-                setTextureHookPrevious_ = currentSetTexture;
-                gOriginalSetTexture = reinterpret_cast<SetTextureFn>(currentSetTexture);
-            }
-            if (replaceDraw)
-            {
-                drawHookPrevious_ = currentDraw;
-                gOriginalDrawPrimitiveUP = reinterpret_cast<DrawPrimitiveUPFn>(currentDraw);
-            }
-
-            bool wroteCreate = false;
-            bool wroteSetTexture = false;
-            bool wroteDraw = false;
-            if (replaceCreate)
-                wroteCreate = write_hook_slot(createHookSlot_, createHook);
-            if ((!replaceCreate || wroteCreate) && replaceSetTexture)
-                wroteSetTexture = write_hook_slot(setTextureHookSlot_, setTextureHook);
-            if ((!replaceCreate || wroteCreate) && (!replaceSetTexture || wroteSetTexture) && replaceDraw)
-                wroteDraw = write_hook_slot(drawHookSlot_, drawHook);
-
-            const bool complete = (!replaceCreate || wroteCreate)
-                && (!replaceSetTexture || wroteSetTexture)
-                && (!replaceDraw || wroteDraw)
-                && hooks_intact();
-            if (complete)
-                return true;
-
-            if (wroteDraw && *drawHookSlot_ == drawHook)
-                write_hook_slot(drawHookSlot_, currentDraw);
-            if (wroteSetTexture && *setTextureHookSlot_ == setTextureHook)
-                write_hook_slot(setTextureHookSlot_, currentSetTexture);
-            if (wroteCreate && *createHookSlot_ == createHook)
-                write_hook_slot(createHookSlot_, currentCreate);
-            createHookPrevious_ = oldCreatePrevious;
-            setTextureHookPrevious_ = oldSetTexturePrevious;
-            drawHookPrevious_ = oldDrawPrevious;
-            gOriginalCreateTexture = reinterpret_cast<CreateTextureFn>(oldCreatePrevious);
-            gOriginalSetTexture = reinterpret_cast<SetTextureFn>(oldSetTexturePrevious);
-            gOriginalDrawPrimitiveUP = reinterpret_cast<DrawPrimitiveUPFn>(oldDrawPrevious);
-            log_line("Hook re-chain failed transactionally; any slots written by SpectralFix were rolled back.");
-            return false;
-        }
-
-        void restore_hooks()
-        {
-            if (drawHookSlot_ != nullptr && drawHookPrevious_ != nullptr)
-            {
-                if (*drawHookSlot_ == reinterpret_cast<void*>(&hook_draw_primitive_up))
+                auto& slot = hooks_[i - 1];
+                if (!slot.tracked)
+                    continue;
+                if (slot.target == nullptr || slot.previous == nullptr)
                 {
-                    if (write_hook_slot(drawHookSlot_, drawHookPrevious_))
-                        log_line("DrawPrimitiveUP hook restored.");
+                    restored = false;
+                    continue;
+                }
+                if (*slot.target == slot.hook)
+                {
+                    if (write_hook_slot(slot.target, slot.previous))
+                    {
+                        slot.tracked = false;
+                        log_line(std::string(slot.name) + " hook restored.");
+                    }
+                    else
+                    {
+                        restored = false;
+                        log_line(std::string(slot.name)
+                            + " hook restoration failed. SpectralFix must remain resident until client exit.");
+                    }
                 }
                 else
                 {
-                    log_line("DrawPrimitiveUP slot not restored because another component owns it. Client exit is required.");
+                    slot.tracked = false;
+                    log_line(std::string(slot.name)
+                        + " slot not restored because another component owns it. Client exit is required.");
                 }
             }
-            if (setTextureHookSlot_ != nullptr && setTextureHookPrevious_ != nullptr)
-            {
-                if (*setTextureHookSlot_ == reinterpret_cast<void*>(&hook_set_texture))
-                {
-                    if (write_hook_slot(setTextureHookSlot_, setTextureHookPrevious_))
-                        log_line("SetTexture observer restored.");
-                }
-                else
-                {
-                    log_line("SetTexture slot not restored because another component owns it. Client exit is required.");
-                }
-            }
-            if (createHookSlot_ != nullptr && createHookPrevious_ != nullptr)
-            {
-                if (*createHookSlot_ == reinterpret_cast<void*>(&hook_create_texture))
-                {
-                    if (write_hook_slot(createHookSlot_, createHookPrevious_))
-                        log_line("CreateTexture hook restored.");
-                }
-                else
-                {
-                    log_line("CreateTexture slot not restored because another component owns it. Client exit is required.");
-                }
-            }
-            drawHookSlot_       = nullptr;
-            setTextureHookSlot_ = nullptr;
-            createHookSlot_     = nullptr;
+            if (restored)
+                forget_hook_table();
+            return restored;
         }
 
         ModuleIdentity read_module_identity() const
@@ -1930,29 +2056,34 @@ namespace spectralfix
                 scratch_.data(), scratch_.size());
         }
 
+        SettingsFile current_settings_file(const Selector& selected) const
+        {
+            SettingsFile file{};
+            file.selector.version          = kSettingsVersion;
+            file.selector.moduleTimestamp  = selected.moduleTimestamp;
+            file.selector.moduleSize       = selected.moduleSize;
+            file.selector.callerRva        = selected.callerRva;
+            file.selector.stackHash        = selected.stackHash;
+            file.selector.signatureOrdinal = selected.signatureOrdinal;
+            file.selector.targetSize       = selected.targetSize;
+            file.visual.spreadOverride           = spreadOverride_;
+            file.visual.opacityPercent           = opacityPercent_;
+            file.visual.compositeOpacityPercent  = compositeOpacityPercent_;
+            file.visual.compositeOpacityOverride = compositeOpacityOverride_;
+            return file;
+        }
+
+        // Serialization lives in settings.hpp; this function only performs the
+        // atomic temp-file-then-rename write.
         bool write_config(const Selector& selected)
         {
+            const auto text          = serialize_settings_text(current_settings_file(selected));
             const auto temporaryPath = configPath_ + ".tmp";
+
             std::ofstream config(temporaryPath, std::ios::out | std::ios::trunc);
             if (!config.is_open())
                 return false;
-            config << "# SpectralFix selector and visual settings. The selector is client-build-specific.\n";
-            config << "version=1\n";
-            config << "module_timestamp=0x" << std::hex << std::uppercase << selected.moduleTimestamp << '\n';
-            config << "module_size=0x" << selected.moduleSize << '\n';
-            config << "caller_rva=0x" << selected.callerRva << '\n';
-            config << "stack_hash=0x" << selected.stackHash << std::dec << '\n';
-            config << "signature_ordinal=" << selected.signatureOrdinal << '\n';
-            config << "target_size=" << selected.targetSize << '\n';
-            config << std::fixed << std::setprecision(2);
-            config << "spread_override=" << spreadOverride_ << " # 0 = automatic\n";
-            config << "opacity_percent=" << opacityPercent_ << " # 100 = stock tap opacity\n";
-            config << "composite_opacity_percent=";
-            if (compositeOpacityOverride_)
-                config << compositeOpacityPercent_;
-            else
-                config << "stock";
-            config << " # stock = original hard-cutout center pass\n";
+            config << text;
             config.flush();
             const bool complete = config.good();
             config.close();
@@ -1987,104 +2118,59 @@ namespace spectralfix
 
         bool save_settings()
         {
-            if (!selector_.valid)
-                return false;
-            auto saved       = selector_;
+            auto saved       = selector_.valid ? selector_ : Selector{};
             saved.targetSize = configuredTargetSize_;
             return write_config(saved);
         }
 
+        // Parsing lives in settings.hpp; this function only reads the file and
+        // applies the result.
         void load_selector()
         {
             std::ifstream config(configPath_);
             if (!config.is_open())
                 return;
+            std::ostringstream buffer;
+            buffer << config.rdbuf();
+            config.close();
+
+            SettingsFile file{};
+            file.visual.spreadOverride           = spreadOverride_;
+            file.visual.opacityPercent           = opacityPercent_;
+            file.visual.compositeOpacityPercent  = compositeOpacityPercent_;
+            file.visual.compositeOpacityOverride = compositeOpacityOverride_;
+
+            std::vector<std::string> warnings;
+            parse_settings_text(buffer.str(), file, warnings);
+            for (const auto& warning : warnings)
+                log_line(warning);
+
+            spreadOverride_           = file.visual.spreadOverride;
+            opacityPercent_           = file.visual.opacityPercent;
+            compositeOpacityPercent_  = file.visual.compositeOpacityPercent;
+            compositeOpacityOverride_ = file.visual.compositeOpacityOverride;
 
             Selector parsed{};
-            std::string line;
-            uint32_t version = 0;
-            while (std::getline(config, line))
-            {
-                const auto hash = line.find('#');
-                if (hash != std::string::npos)
-                    line.erase(hash);
-                const auto equal = line.find('=');
-                if (equal == std::string::npos)
-                    continue;
-                auto key   = lower_copy(trim_copy(line.substr(0, equal)));
-                auto value = trim_copy(line.substr(equal + 1));
-                if (key == "spread_override")
-                {
-                    float number = 0.0F;
-                    if (parse_float(value, number)
-                        && (number == 0.0F
-                            || (number >= kMinManualSpread && number <= kMaxManualSpread)))
-                        spreadOverride_ = number;
-                    else
-                        log_line("Ignored malformed spectralfix.ini value for key: " + key);
-                    continue;
-                }
-                if (key == "opacity_percent")
-                {
-                    float number = 0.0F;
-                    if (parse_float(value, number) && number >= 0.0F && number <= 100.0F)
-                        opacityPercent_ = number;
-                    else
-                        log_line("Ignored malformed spectralfix.ini value for key: " + key);
-                    continue;
-                }
-                if (key == "composite_opacity_percent")
-                {
-                    if (lower_copy(value) == "stock" || lower_copy(value) == "auto")
-                    {
-                        compositeOpacityOverride_ = false;
-                        compositeOpacityPercent_ = kDefaultOpacityPercent;
-                    }
-                    else
-                    {
-                        float number = 0.0F;
-                        if (parse_float(value, number) && number >= 0.0F && number <= 100.0F)
-                        {
-                            compositeOpacityOverride_ = true;
-                            compositeOpacityPercent_ = number;
-                        }
-                        else
-                        {
-                            log_line("Ignored malformed spectralfix.ini value for key: " + key);
-                        }
-                    }
-                    continue;
-                }
-                try
-                {
-                    const auto number = static_cast<uint32_t>(std::stoul(value, nullptr, 0));
-                    if (key == "version") version = number;
-                    else if (key == "module_timestamp") parsed.moduleTimestamp = number;
-                    else if (key == "module_size") parsed.moduleSize = number;
-                    else if (key == "caller_rva") parsed.callerRva = number;
-                    else if (key == "stack_hash") parsed.stackHash = number;
-                    else if (key == "signature_ordinal") parsed.signatureOrdinal = number;
-                    else if (key == "target_size") parsed.targetSize = number;
-                }
-                catch (...)
-                {
-                    log_line("Ignored malformed spectralfix.ini value for key: " + key);
-                }
-            }
+            parsed.moduleTimestamp  = file.selector.moduleTimestamp;
+            parsed.moduleSize       = file.selector.moduleSize;
+            parsed.callerRva        = file.selector.callerRva;
+            parsed.stackHash        = file.selector.stackHash;
+            parsed.signatureOrdinal = file.selector.signatureOrdinal;
+            parsed.targetSize       = file.selector.targetSize;
             // Ashita can make caller_rva zero; the stack hash and ordinal remain authoritative.
             parsed.valid = selector_fields_valid(
-                version,
+                file.selector.version,
                 parsed.moduleTimestamp,
                 parsed.moduleSize,
                 parsed.callerRva,
                 parsed.stackHash,
                 parsed.signatureOrdinal,
                 parsed.targetSize);
-            selector_ = parsed;
+
+            selector_                 = parsed;
             selectorLoadedFromConfig_ = selector_.valid;
-            if (selector_.valid)
-                configuredTargetSize_ = selector_.targetSize;
-            if (!selector_.valid)
+            configuredTargetSize_     = file.selector.targetSize;
+            if (!selector_.valid && selector_identity_present(file.selector))
                 log_line("spectralfix.ini exists but is incomplete or invalid; observe-only mode retained.");
         }
 
@@ -2104,9 +2190,19 @@ namespace spectralfix
         std::string mode_text() const
         {
             if (selectorMismatch_)
-                return "disabled after allocation mismatch; immediate client exit required";
+                return enlargementPublished_
+                    ? "allocation mismatch; adjustments stopped, enlarged allocation still corrected, immediate client exit required"
+                    : "disabled after allocation mismatch; immediate client exit required";
+            if (releaseRefused_)
+                return "unload refused while an enlarged allocation is live; correction continues until client exit";
+            if (correctionLost_)
+                return "hook displaced out of the draw chain; enlarged allocation can no longer be corrected, immediate client exit required";
+            if (displacementVerdictPending_)
+                return "hook displaced; measuring whether the draw hook is still called";
             if (hookDisplaced_)
-                return "disabled after hook displacement";
+                return enlargementPublished_
+                    ? "hook displaced; no new enlargements, enlarged allocation still corrected"
+                    : "disabled after hook displacement";
             if (targetUnsupported_)
                 return "disabled because requested target exceeds device limits";
             if (selectorFromOrdinalDefault_ && selectorVerificationPending_)
@@ -2191,6 +2287,7 @@ namespace spectralfix
                 << " activity_entries=" << activity_.size()
                 << " signature_tracking_drops=" << signatureTrackingDrops_
                 << " activity_tracking_drops=" << activityTrackingDrops_
+                << " candidate_context_rejections=" << candidateContextRejections_
                 << " resized=" << resizedAllocations_
                 << " intercepted=" << interceptedDraws_
                 << " stage0_bindings=" << stageZeroBindings_
@@ -2223,7 +2320,18 @@ namespace spectralfix
                 << " max_texture_height=" << maxTextureHeight_
                 << " target_unsupported=" << (targetUnsupported_ ? "true" : "false")
                 << " module_pinned=" << (modulePinned_ ? "true" : "false")
-                << " hook_rechains=" << hookRechains_ << std::defaultfloat
+                << " allow_new_enlargements=" << (allowNewEnlargements_ ? "true" : "false")
+                << " aura_features=" << (auraFeaturesEnabled_ ? "true" : "false")
+                << " enlargement_published=" << (enlargementPublished_ ? "true" : "false")
+                << " hooks_published=" << (hooksPublished_ ? "true" : "false")
+                << " logging_available=" << (loggingAvailable_ ? "true" : "false")
+                << " logging_disabled_at_limit=" << (loggingDisabledAtLimit_ ? "true" : "false")
+                << " correction_lost=" << (correctionLost_ ? "true" : "false")
+                << " release_refused=" << (releaseRefused_ ? "true" : "false")
+                << " displacement_verdict_pending=" << (displacementVerdictPending_ ? "true" : "false")
+                << " draw_chain_missed_windows=" << missedDrawChainWindows_
+                << " stage0_trustworthy=" << (stage_zero_tracking_trustworthy() ? "true" : "false")
+                << std::defaultfloat
                 << " selector_source="
                 << (selectorFromOrdinalDefault_ ? "ordinal1-default"
                     : (selectorLoadedFromConfig_ ? "saved" : "none"))
@@ -2234,6 +2342,7 @@ namespace spectralfix
                 << " native_stage0_query_mode=" << (nativeStageZeroQueryMode_ ? "true" : "false")
                 << " log_bytes=" << logBytesWritten_
                 << " log_rotation_failed=" << (logRotationFailedThisRun_ ? "true" : "false")
+                << " hook_rollback_incomplete=" << (hookRollbackIncomplete_ ? "true" : "false")
                 << " draw_failures=" << drawFailures_
                 << " callback_failures=" << callbackFailures_
                 << " unmarked_blur_draws=" << unmarkedBlurDraws_
@@ -2281,7 +2390,7 @@ namespace spectralfix
 
         void log_line(const std::string& message)
         {
-            if (!log_.is_open())
+            if (!loggingAvailable_)
                 return;
             SYSTEMTIME time{};
             ::GetLocalTime(&time);
@@ -2294,6 +2403,12 @@ namespace spectralfix
             const auto text = record.str();
 
             std::unique_lock<std::mutex> lock(logMutex_);
+            if (!log_.is_open())
+            {
+                loggingAvailable_          = false;
+                pendingLogDisabledWarning_ = true;
+                return;
+            }
             if (!logRotationFailedThisRun_ && logBytesWritten_ + text.size() > kMaxLogBytes)
             {
                 log_.flush();
@@ -2307,17 +2422,31 @@ namespace spectralfix
                 else
                 {
                     logRotationFailedThisRun_ = true;
-                    log_.open(logPath_, std::ios::out | std::ios::app);
-                    logBytesWritten_ = file_size_or_zero(logPath_);
+                    loggingDisabledAtLimit_   = true;
+                    loggingAvailable_         = false;
+                    pendingLogDisabledWarning_ = true;
+                    return;
                 }
             }
 
-            if (log_.is_open())
+            if (!log_.is_open())
             {
-                log_ << text;
-                log_.flush();
-                if (log_.good())
-                    logBytesWritten_ += text.size();
+                loggingAvailable_          = false;
+                pendingLogDisabledWarning_ = true;
+                return;
+            }
+
+            log_ << text;
+            log_.flush();
+            if (log_.good())
+            {
+                logBytesWritten_ += text.size();
+            }
+            else
+            {
+                log_.close();
+                loggingAvailable_          = false;
+                pendingLogDisabledWarning_ = true;
             }
             lock.unlock();
         }
@@ -2332,7 +2461,18 @@ __declspec(dllexport) IPlugin* __stdcall expCreatePlugin(const char* args)
 
 __declspec(dllexport) void __stdcall expDestroyPlugin(void* instance)
 {
-    delete static_cast<spectralfix::Plugin*>(instance);
+    auto* plugin = static_cast<spectralfix::Plugin*>(instance);
+    if (plugin == nullptr)
+        return;
+
+    // Deliberately leaked when Release was refused: this instance is still reachable
+    // from the hook functions sitting in the device vtable, so destroying it would
+    // turn every later draw into a use-after-free. The module is already pinned for
+    // the process lifetime for the same reason.
+    if (plugin->release_refused())
+        return;
+
+    delete plugin;
 }
 
 __declspec(dllexport) double __stdcall expGetInterfaceVersion()
