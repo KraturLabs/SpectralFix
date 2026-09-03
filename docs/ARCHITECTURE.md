@@ -43,15 +43,22 @@ valid. Native stock-sized textures never use a broad dimension-only match.
 
 Allocation context is explicit evidence rather than a single boolean. Raw device
 pointer equality is the strongest path. Candidate-shaped allocations with a
-different interface pointer may use balanced `QueryInterface(IID_IUnknown)` calls
-to prove canonical COM identity; a shared vtable is never identity. At least one
+different interface pointer enter a fixed-capacity cache that performs one
+balanced `QueryInterface(IID_IUnknown)` validation, retains the accepted or
+rejected raw alias against pointer reuse, and releases every retained reference
+at normal teardown. CreateTexture, SetTexture, and DrawPrimitiveUP may expose
+different aliases for the same device; a shared vtable is never identity. At least one
 FFXiMain source is required: the direct caller RVA, the bounded stack hash, or
-both. With neither, the allocation is counted as observe-only and remains stock.
+both. With neither, the allocation is rejected and remains stock.
 
 Saved selectors retain the FFXiMain timestamp, image size, allocation ordinal,
 caller RVA, and stack hash. A caller-only or stack-only selector is valid. Exact
 matching is preferred when both identity fields are available; one unavailable
-field permits an explicit caller or stack fallback. Conflicting nonzero evidence,
+field permits an explicit caller or stack fallback. If a weak saved selector later
+observes both fields, it does not enlarge that candidate: activity may save the
+stronger identity for the next full launch. Each session binds a compatible selector
+to one candidate ID, and markers, confirmation, and dimension fallbacks must carry
+that same ID. Conflicting nonzero evidence,
 module changes, ordinal changes, and selectors with both identity fields zero are
 rejected and logged by reason. Existing v1.01/v1.02 version-1 INI files remain
 readable.
@@ -66,8 +73,11 @@ a documented manual prerequisite rather than a runtime health signal.
 Hook installation is transactional. SpectralFix publishes no enlarged allocation
 unless all required hooks are installed. Every rollback write is verified; if a
 partial install cannot be restored exactly, SpectralFix preserves the ownership it
-can prove, stays resident when necessary, and requires a client restart. It checks
-vtable ownership every sixty presented frames. A newly installed owner is left in
+can prove, stays resident when necessary, and requires a client restart. It performs
+the full hook-table and owner-module diagnostic scan every sixty presented frames.
+Draw callbacks additionally read only their own vtable slot so an ownership change
+between Present samples blocks enlargement immediately; logging and module lookup
+remain outside the draw hot path. A newly installed owner is left in
 place because it may have saved SpectralFix as its previous function; installing
 SpectralFix above it could create a recursive forwarding cycle. Unknown ownership
 therefore fails closed.
@@ -80,8 +90,10 @@ stricter: new enlargement requires direct ownership or forwarding observed after
 the latest displacement and within the bounded evidence window.
 
 One successful DrawPrimitiveUP sample does not permanently prove the chain is
-safe. SpectralFix watches intercepted draws every sixty presented frames.
-Activity resets the watchdog; three consecutive windows without a draw expire
+safe. SpectralFix watches trusted-runtime-device draws every sixty presented frames.
+Callbacks from another device remain diagnostic-only and cannot refresh evidence,
+recover correction, or unlock enlargement. Trusted activity resets the watchdog;
+three consecutive windows without a trusted draw expire
 the evidence. If a live enlarged allocation exists, that loss produces an
 immediate-exit warning. Later intercepted forwarding can recover capability for
 later allocations. If SpectralFix owns the draw slot directly, no sampling verdict
@@ -96,7 +108,8 @@ may already forward into SpectralFix.
 Once hooks are published, the SpectralFix module is pinned for the process
 lifetime. This keeps its passthrough code mapped even if another component retains
 SpectralFix in a hook chain. In-process unload and reload are deliberately refused;
-users must exit the client.
+users must exit the client. If release is refused, the alias cache and its balanced
+retained references intentionally remain resident until process exit with the hooks.
 
 The primary lifetime mechanism is
 `GetModuleHandleEx(PIN | FROM_ADDRESS)`. Failure records `GetLastError` and leaves

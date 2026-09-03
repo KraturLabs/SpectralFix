@@ -3,7 +3,7 @@
 ## Automated checks
 
 Both Ashita ABIs compile as 32-bit Release builds with C++20 and `/W4 /WX`.
-The current matrix contains seven CTest jobs per ABI.
+The current matrix contains eight CTest jobs per ABI.
 
 The test suite verifies:
 
@@ -12,7 +12,8 @@ The test suite verifies:
   1024, 2048, and 4096.
 - Ordinal-1 startup selection, activity confirmation, mismatch handling, and
   client-specific selector validation, including exact, caller-only, stack-only,
-  module/ordinal mismatch, conflicting identity, and insufficient evidence.
+  module/ordinal mismatch, conflicting identity, stronger-identity relearning,
+  one-candidate-per-session binding, and insufficient evidence.
 - The spectralfix.ini round trip, parsing of existing v1.01 files including CRLF
   and inline comments, settings-only persistence before a selector is learned,
   rejection of out-of-range and negative values, and silent tolerance of unknown
@@ -20,6 +21,7 @@ The test suite verifies:
 - Hook table decisions: displacement detection, SetTexture query fallback,
   independent CreateTexture/SetTexture/DrawPrimitiveUP capabilities, recovery from
   current forwarding evidence, stale/lost evidence, and the draw-chain watchdog.
+  Wrong-device callbacks cannot refresh, recover, or unlock draw capability.
   Unknown late owners are preserved rather than overwritten.
 - Runtime safety policy through a fake vtable: complete publication, successful
   rollback, write failure after partial publication, rollback failure with accurate
@@ -29,6 +31,9 @@ The test suite verifies:
 - Allocation-context policy: exact device plus caller/stack, caller-only, and
   stack-only evidence; canonical COM identity fallback; wrong logical device,
   shared-vtable-only identity, and both FFXiMain sources absent.
+- Bounded device-alias lifetime through fake COM interfaces: separate aliases per
+  method, cached cross-method reuse, shared-vtable/different-identity rejection,
+  capacity failure, and balanced retained references at teardown.
 - Center-composite state capture, application, and restoration, including full
   restoration while a faulting draw unwinds and after a partially applied state
   change.
@@ -58,15 +63,14 @@ These revisions exactly match the `Ashita.h` files in the two tested client SDKs
 ## Unreleased compatibility-pass verification
 
 On 2026-09-03, `scripts/Build-All.ps1` completed against both pinned SDKs. Ashita
-4.16 passed 7/7 CTest jobs and Ashita 4.30 passed 7/7, for 14/14 total. Both
+4.16 passed 8/8 CTest jobs and Ashita 4.30 passed 8/8, for 16/16 total. Both
 Win32 Release DLLs compiled under `/W4 /WX`; export smoke reported plugin version
 1.02 and the expected interface for each build. Each generated package contained
 only `BUILD.txt`, `INSTALL.txt`, `LICENSE.txt`, and `spectralfix.dll`.
 
-The wrapper-smoke executable compiled for both ABIs, but this pass did not load an
-external D3D8 wrapper because no runtime wrapper path is part of the repository
-verification input. No live FFXI, Windows-wrapper, or Wine runtime result is
-claimed for the compatibility pass.
+The wrapper-smoke executable compiled for both ABIs. Both utilities loaded
+`C:\Windows\SysWOW64\d3d8.dll` and reported `Direct3DCreate8 succeeded`. This is
+a loader/export check, not a live FFXI or Wine runtime claim.
 
 ## Runtime evidence before standalone extraction
 

@@ -24,7 +24,6 @@ namespace spectralfix
     {
         trustedStrong,
         trustedFallback,
-        observeOnly,
         rejectedWrongDevice,
         rejectedDeviceIdentityUnavailable,
         rejectedNoFFXiMainIdentity,
@@ -55,7 +54,7 @@ namespace spectralfix
 
         const auto evidence = allocation_identity_evidence(callerRva, stackHash);
         if (evidence == AllocationIdentityEvidence::none)
-            return CandidateContextDecision::observeOnly;
+            return CandidateContextDecision::rejectedNoFFXiMainIdentity;
         return deviceIdentity == DeviceIdentityResult::exactPointer
                 && evidence == AllocationIdentityEvidence::callerAndStack
             ? CandidateContextDecision::trustedStrong
@@ -74,7 +73,6 @@ namespace spectralfix
         {
             case CandidateContextDecision::trustedStrong: return "trusted-strong";
             case CandidateContextDecision::trustedFallback: return "trusted-fallback";
-            case CandidateContextDecision::observeOnly: return "observe-only-no-ffximain-identity";
             case CandidateContextDecision::rejectedWrongDevice: return "rejected-wrong-device";
             case CandidateContextDecision::rejectedDeviceIdentityUnavailable: return "rejected-device-identity-unavailable";
             default: return "rejected-no-ffximain-identity";
@@ -97,6 +95,7 @@ namespace spectralfix
         exact,
         callerFallback,
         stackFallback,
+        strongerEvidenceRequiresLearning,
         pendingVerification,
         moduleMismatch,
         ordinalMismatch,
@@ -119,15 +118,23 @@ namespace spectralfix
         if (selectedModuleTimestamp != observedModuleTimestamp
             || selectedModuleSize != observedModuleSize)
             return SelectorMatchResult::moduleMismatch;
-        if (selectedSignatureOrdinal != observedSignatureOrdinal)
-            return SelectorMatchResult::ordinalMismatch;
-
         const bool callerComparable = selectedCallerRva != 0 && observedCallerRva != 0;
         const bool stackComparable = selectedStackHash != 0 && observedStackHash != 0;
         const bool callerConflict = callerComparable && selectedCallerRva != observedCallerRva;
         const bool stackConflict = stackComparable && selectedStackHash != observedStackHash;
         if (callerConflict || stackConflict)
             return SelectorMatchResult::conflictingIdentity;
+
+        const bool selectedHasCaller = selectedCallerRva != 0;
+        const bool selectedHasStack = selectedStackHash != 0;
+        const bool observedHasCaller = observedCallerRva != 0;
+        const bool observedHasStack = observedStackHash != 0;
+        if ((selectedHasCaller != selectedHasStack)
+            && observedHasCaller && observedHasStack)
+            return SelectorMatchResult::strongerEvidenceRequiresLearning;
+
+        if (selectedSignatureOrdinal != observedSignatureOrdinal)
+            return SelectorMatchResult::ordinalMismatch;
 
         const bool callerMatch = callerComparable && selectedCallerRva == observedCallerRva;
         const bool stackMatch = stackComparable && selectedStackHash == observedStackHash;
@@ -138,6 +145,11 @@ namespace spectralfix
         if (stackMatch)
             return SelectorMatchResult::stackFallback;
         return SelectorMatchResult::insufficientEvidence;
+    }
+
+    constexpr bool selector_match_requires_learning(const SelectorMatchResult result)
+    {
+        return result == SelectorMatchResult::strongerEvidenceRequiresLearning;
     }
 
     constexpr bool selector_match_is_compatible(const SelectorMatchResult result)
@@ -154,6 +166,7 @@ namespace spectralfix
             case SelectorMatchResult::exact: return "exact";
             case SelectorMatchResult::callerFallback: return "caller-fallback";
             case SelectorMatchResult::stackFallback: return "stack-fallback";
+            case SelectorMatchResult::strongerEvidenceRequiresLearning: return "stronger-evidence-requires-learning";
             case SelectorMatchResult::pendingVerification: return "pending-verification";
             case SelectorMatchResult::moduleMismatch: return "module-mismatch";
             case SelectorMatchResult::ordinalMismatch: return "ordinal-mismatch";
@@ -168,6 +181,31 @@ namespace spectralfix
         confirmed,
         mismatch,
     };
+
+    enum class SessionCandidateDecision
+    {
+        select,
+        selected,
+        rejectDifferentCandidate,
+        learnStrongerIdentity,
+        incompatible,
+    };
+
+    constexpr SessionCandidateDecision evaluate_session_candidate(
+        const SelectorMatchResult selectorMatch,
+        const uint32_t selectedCandidateId,
+        const uint32_t observedCandidateId)
+    {
+        if (selector_match_requires_learning(selectorMatch))
+            return SessionCandidateDecision::learnStrongerIdentity;
+        if (!selector_match_is_compatible(selectorMatch) || observedCandidateId == 0)
+            return SessionCandidateDecision::incompatible;
+        if (selectedCandidateId == 0)
+            return SessionCandidateDecision::select;
+        return selectedCandidateId == observedCandidateId
+            ? SessionCandidateDecision::selected
+            : SessionCandidateDecision::rejectDifferentCandidate;
+    }
 
     constexpr bool resource_marker_dimensions_valid(
         const uint32_t originalSize,
@@ -215,6 +253,18 @@ namespace spectralfix
         return identityMatches
             ? SelectorActivityDecision::confirmed
             : SelectorActivityDecision::mismatch;
+    }
+
+    constexpr SelectorActivityDecision evaluate_selector_activity_for_candidate(
+        const bool verificationPending,
+        const bool identityMatches,
+        const uint32_t selectedCandidateId,
+        const uint32_t observedCandidateId)
+    {
+        return evaluate_selector_activity(
+            verificationPending,
+            identityMatches && selectedCandidateId != 0
+                && selectedCandidateId == observedCandidateId);
     }
 
     constexpr bool selected_aura_marker_is_trackable(

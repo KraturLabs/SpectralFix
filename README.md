@@ -70,10 +70,17 @@ shape: both FFXiMain identity fields absent, a different logical device, an
 unproven DrawPrimitiveUP path, or a conflicting saved selector keeps the original
 256x256 allocation.
 
+Alternate device-interface pointers are validated once and retained in a bounded
+cache, so normal draws do not repeat COM identity queries. A caller-only or
+stack-only saved selector also stays at 256x256 when both identity fields become
+available; aura activity can save that stronger selector for the next full launch.
+Only one matching candidate ID can be selected and confirmed in a session.
+
 Unknown graphics-hook owners are never overwritten. SetTexture observation can
 fall back to a narrow stage-zero query, while new enlargement remains blocked
 until required DrawPrimitiveUP correction is directly owned or recently observed
-forwarding into SpectralFix.
+forwarding into SpectralFix from the verified runtime device. Callbacks from a
+different device never count as forwarding evidence.
 
 ## Why this is a plugin instead of an addon
 

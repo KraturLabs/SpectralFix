@@ -27,7 +27,7 @@ int main()
         || evaluate_candidate_context(DeviceIdentityResult::exactPointer, 0, 0x2000)
             != CandidateContextDecision::trustedFallback
         || evaluate_candidate_context(DeviceIdentityResult::exactPointer, 0, 0)
-            != CandidateContextDecision::observeOnly)
+            != CandidateContextDecision::rejectedNoFFXiMainIdentity)
     {
         std::cerr << "allocation identity evidence was classified incorrectly\n";
         return 2;
@@ -46,9 +46,9 @@ int main()
 
     if (!candidate_context_is_trusted(CandidateContextDecision::trustedStrong)
         || !candidate_context_is_trusted(CandidateContextDecision::trustedFallback)
-        || candidate_context_is_trusted(CandidateContextDecision::observeOnly)
+        || candidate_context_is_trusted(CandidateContextDecision::rejectedNoFFXiMainIdentity)
         || std::string(candidate_context_name(CandidateContextDecision::rejectedWrongDevice))
-            == std::string(candidate_context_name(CandidateContextDecision::observeOnly)))
+            == std::string(candidate_context_name(CandidateContextDecision::rejectedNoFFXiMainIdentity)))
     {
         std::cerr << "candidate trust or diagnostic reason mapping is incorrect\n";
         return 4;
@@ -81,9 +81,9 @@ int main()
     if (evaluate_selector_match(
             1, 2, 3, 4, 5, 1, 2, 3, 4, 5) != SelectorMatchResult::exact
         || evaluate_selector_match(
-            1, 2, 3, 0, 5, 1, 2, 3, 9, 5) != SelectorMatchResult::callerFallback
+            1, 2, 3, 0, 5, 1, 2, 3, 9, 5) != SelectorMatchResult::strongerEvidenceRequiresLearning
         || evaluate_selector_match(
-            1, 2, 0, 4, 5, 1, 2, 9, 4, 5) != SelectorMatchResult::stackFallback)
+            1, 2, 0, 4, 5, 1, 2, 9, 4, 5) != SelectorMatchResult::strongerEvidenceRequiresLearning)
     {
         std::cerr << "selector exact and compatibility matching is incorrect\n";
         return 8;
@@ -104,6 +104,47 @@ int main()
     {
         std::cerr << "selector conflicts and rejection reasons are incorrect\n";
         return 9;
+    }
+
+
+    if (selector_match_is_compatible(SelectorMatchResult::strongerEvidenceRequiresLearning)
+        || !selector_match_requires_learning(SelectorMatchResult::strongerEvidenceRequiresLearning)
+        || evaluate_session_candidate(SelectorMatchResult::callerFallback, 0, 10)
+            != SessionCandidateDecision::select
+        || evaluate_session_candidate(SelectorMatchResult::callerFallback, 10, 10)
+            != SessionCandidateDecision::selected
+        || evaluate_session_candidate(SelectorMatchResult::callerFallback, 10, 11)
+            != SessionCandidateDecision::rejectDifferentCandidate
+        || evaluate_session_candidate(SelectorMatchResult::strongerEvidenceRequiresLearning, 0, 11)
+            != SessionCandidateDecision::learnStrongerIdentity
+        || evaluate_selector_activity_for_candidate(true, true, 10, 11)
+            != SelectorActivityDecision::mismatch
+        || evaluate_selector_activity_for_candidate(true, true, 10, 10)
+            != SelectorActivityDecision::confirmed)
+    {
+        std::cerr << "weak-selector ambiguity or candidate binding was accepted\n";
+        return 16;
+    }
+
+    const auto callerOnlyToStackX = evaluate_selector_match(
+        1, 2, 0xA, 0, 1, 1, 2, 0xA, 0x10, 1);
+    const auto callerOnlyToStackY = evaluate_selector_match(
+        1, 2, 0xA, 0, 1, 1, 2, 0xA, 0x20, 1);
+    const auto stackOnlyToCallerX = evaluate_selector_match(
+        1, 2, 0, 0xB, 1, 1, 2, 0x10, 0xB, 1);
+    const auto stackOnlyToCallerY = evaluate_selector_match(
+        1, 2, 0, 0xB, 1, 1, 2, 0x20, 0xB, 1);
+    if (callerOnlyToStackX != SelectorMatchResult::strongerEvidenceRequiresLearning
+        || callerOnlyToStackY != SelectorMatchResult::strongerEvidenceRequiresLearning
+        || stackOnlyToCallerX != SelectorMatchResult::strongerEvidenceRequiresLearning
+        || stackOnlyToCallerY != SelectorMatchResult::strongerEvidenceRequiresLearning
+        || selector_match_is_compatible(callerOnlyToStackX)
+        || selector_match_is_compatible(callerOnlyToStackY)
+        || selector_match_is_compatible(stackOnlyToCallerX)
+        || selector_match_is_compatible(stackOnlyToCallerY))
+    {
+        std::cerr << "weak selectors trusted multiple stronger signatures\n";
+        return 17;
     }
 
     if (!selector_fields_valid(kSettingsVersion, 1, 2, 3, 4, 1, kDefaultTargetSize)
@@ -145,7 +186,6 @@ int main()
     const CandidateContextDecision decisions[]{
         CandidateContextDecision::trustedStrong,
         CandidateContextDecision::trustedFallback,
-        CandidateContextDecision::observeOnly,
         CandidateContextDecision::rejectedWrongDevice,
         CandidateContextDecision::rejectedDeviceIdentityUnavailable,
         CandidateContextDecision::rejectedNoFFXiMainIdentity,
@@ -169,7 +209,7 @@ int main()
     {
         (void)wineDetected;
         if (evaluate_candidate_context(DeviceIdentityResult::exactPointer, 0, 0)
-            != CandidateContextDecision::observeOnly)
+            != CandidateContextDecision::rejectedNoFFXiMainIdentity)
         {
             std::cerr << "environment diagnostics changed candidate safety policy\n";
             return 15;

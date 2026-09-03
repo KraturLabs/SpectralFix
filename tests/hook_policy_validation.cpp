@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <string>
 
 namespace
 {
@@ -205,6 +206,65 @@ int main()
     {
         std::cerr << "CreateTexture loss incorrectly disabled live correction\n";
         return 20;
+    }
+
+
+    DrawForwardingEvidence evidence{};
+    evidence.correctionLost = true;
+    if (record_draw_callback(evidence, DeviceIdentityResult::mismatch, false, 100)
+        || evidence.trustedRuntimeDraws != 0
+        || evidence.forwardingObserved
+        || !evidence.correctionLost
+        || evidence.recoveryPending)
+    {
+        std::cerr << "wrong-device traffic changed trusted forwarding evidence\n";
+        return 21;
+    }
+    capability.drawSlotOwned = false;
+    capability.drawForwardingObserved = evidence.forwardingObserved;
+    capability.drawForwardingLost = evidence.correctionLost;
+    capability.createCallbackActive = true;
+    capability.baseEnlargementAllowed = true;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (runtime.publishNewEnlargement || runtime.correctEnlargedDownsample)
+    {
+        std::cerr << "wrong-device traffic unlocked enlargement capability\n";
+        return 22;
+    }
+    if (!record_draw_callback(
+            evidence, DeviceIdentityResult::canonicalComIdentity, false, 101)
+        || evidence.trustedRuntimeDraws != 1
+        || !evidence.forwardingObserved
+        || evidence.correctionLost
+        || !evidence.recoveryPending
+        || evidence.lastForwardingFrame != 101)
+    {
+        std::cerr << "trusted-device traffic did not recover forwarding evidence\n";
+        return 23;
+    }
+    begin_draw_owner_epoch(evidence, true);
+    if (evidence.forwardingObserved || !evidence.correctionLost
+        || evidence.trustedAtLastSample != evidence.trustedRuntimeDraws
+        || evidence.consecutiveMisses != 0)
+    {
+        std::cerr << "draw-owner epoch did not reset trusted sampling state\n";
+        return 24;
+    }
+    if (evaluate_draw_chain_sample(false, evidence.trustedRuntimeDraws,
+            evidence.trustedAtLastSample, 2, 3).health != DrawChainHealth::lost)
+    {
+        std::cerr << "wrong-device callbacks kept the trusted watchdog alive\n";
+        return 25;
+    }
+
+    if (!stage_zero_query_activation_succeeded(StageZeroQueryActivationResult::activated)
+        || !stage_zero_query_activation_succeeded(StageZeroQueryActivationResult::alreadyActive)
+        || stage_zero_query_activation_succeeded(StageZeroQueryActivationResult::ownerUnavailable)
+        || std::string(stage_zero_query_activation_name(
+            StageZeroQueryActivationResult::ownerStillOurs)) != "owner-still-spectralfix")
+    {
+        std::cerr << "stage-zero query activation diagnostics are incorrect\n";
+        return 26;
     }
 
     return 0;
