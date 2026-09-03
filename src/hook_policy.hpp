@@ -10,6 +10,7 @@
 namespace spectralfix
 {
     constexpr uint32_t kDrawChainMissThreshold = 3;
+    constexpr uint64_t kDrawForwardingFreshFrames = 180;
 
     // A snapshot of one vtable slot at the moment a decision is being made.
     struct HookSlotView
@@ -64,6 +65,49 @@ namespace spectralfix
         DrawChainHealth health{DrawChainHealth::inconclusive};
         uint32_t consecutiveMisses{0};
     };
+
+    struct RuntimeCapabilityInput
+    {
+        bool createCallbackActive{false};
+        bool drawSlotOwned{false};
+        bool drawForwardingObserved{false};
+        bool drawForwardingLost{false};
+        bool setTextureSlotOwned{false};
+        bool stageZeroQueryFallback{false};
+        bool baseEnlargementAllowed{false};
+        uint64_t currentFrame{0};
+        uint64_t lastDrawForwardingFrame{0};
+    };
+
+    struct RuntimeCapabilities
+    {
+        bool observeNewAllocations{false};
+        bool correctEnlargedDownsample{false};
+        bool observeStageZeroIdentity{false};
+        bool applyOptionalAppearance{false};
+        bool publishNewEnlargement{false};
+        bool drawForwardingRecent{false};
+    };
+
+    constexpr RuntimeCapabilities evaluate_runtime_capabilities(
+        const RuntimeCapabilityInput& input)
+    {
+        const bool forwardingRecent = input.drawForwardingObserved
+            && !input.drawForwardingLost
+            && input.currentFrame >= input.lastDrawForwardingFrame
+            && input.currentFrame - input.lastDrawForwardingFrame
+                <= kDrawForwardingFreshFrames;
+        const bool correction = input.drawSlotOwned || forwardingRecent;
+        const bool stageZero = input.setTextureSlotOwned || input.stageZeroQueryFallback;
+        return {
+            input.createCallbackActive,
+            correction,
+            stageZero,
+            correction && stageZero,
+            input.createCallbackActive && correction && input.baseEnlargementAllowed,
+            forwardingRecent,
+        };
+    }
 
     // A foreign function at the top of the DrawPrimitiveUP slot can still be
     // safely forwarding to SpectralFix. Treat one quiet sample as inconclusive;

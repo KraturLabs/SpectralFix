@@ -105,6 +105,9 @@ namespace spectralfix
     {
         bool candidate{false};
         bool resize{false};
+        CandidateContextDecision contextDecision{CandidateContextDecision::observeOnly};
+        DeviceIdentityResult deviceIdentity{DeviceIdentityResult::unavailable};
+        SelectorMatchResult selectorMatch{SelectorMatchResult::insufficientEvidence};
         uint32_t candidateId{0};
         uint32_t signatureOrdinal{0};
         uint32_t callerRva{0};
@@ -247,6 +250,14 @@ namespace spectralfix
 
             log_line(std::string("=== SpectralFix v") + kVersionString + " initialized ===");
             log_line("Ashita install: " + installPath_);
+            detect_environment();
+            {
+                std::ostringstream environment;
+                environment << "Environment: "
+                    << (wineDetected_ ? "Wine " + wineVersion_ : "native Windows")
+                    << "; Ashita interface=" << ASHITA_INTERFACE_VERSION;
+                log_line(environment.str());
+            }
             log_line(module_.valid
                 ? hex_line("FFXiMain identity", module_.timestamp, module_.size)
                 : "FFXiMain identity unavailable during plugin Initialize; will retry at Direct3DInitialize.");
@@ -414,9 +425,9 @@ namespace spectralfix
             if ((frames_ % 60) == 0)
             {
                 const bool verdictWasPending = displacementVerdictPending_;
-                if (!hooks_intact())
-                    handle_hook_displacement();
-                if (verdictWasPending && displacementVerdictPending_)
+                refresh_hook_health();
+                if (verdictWasPending && displacementVerdictPending_
+                    && frames_ >= drawChainSampleNotBeforeFrame_)
                     resolve_displacement_verdict();
             }
 
@@ -488,6 +499,12 @@ namespace spectralfix
                     ? "First classified center composite omitted successfully."
                     : "First classified center composite opacity adjustment applied successfully.");
             }
+            if (pendingDrawForwardingRecovery_)
+            {
+                pendingDrawForwardingRecovery_ = false;
+                log_line("DrawPrimitiveUP forwarding resumed after a quiet-window loss; required correction and later enlargement capability recovered.");
+                chat("SpectralFix draw forwarding resumed. Required correction is active again; see spectralfix.log for details.");
+            }
             if (compositeRestoreFailed_)
             {
                 compositeRestoreFailed_ = false;
@@ -528,67 +545,73 @@ namespace spectralfix
             return nativeStageZeroQueryMode_ || slot_is_ours(kHookSetTexture);
         }
 
-        void handle_hook_displacement()
+        void refresh_hook_health()
         {
-            if (activate_native_stage_zero_query_mode())
-            {
-                log_line("SetTexture observer released; native stage-zero query mode is active.");
+            if (!hooksPublished_)
                 return;
-            }
-            if (hookDisplaced_)
+
+            bool anyDisplaced = false;
+            for (size_t i = 0; i < kHookCount; ++i)
             {
-                if (enlargementPublished_ && !correctionLost_
-                    && !slot_is_ours(kHookDrawPrimitiveUP)
-                    && !displacementVerdictPending_)
+                const auto& slot = hooks_[i];
+                const auto current = slot.tracked && slot.target != nullptr
+                    ? *slot.target
+                    : nullptr;
+                const HookSlotView view{slot.hook, current, slot.tracked && slot.target != nullptr};
+                const bool displaced = slot_is_displaced(view);
+                const bool ownerChanged = lastObservedHookOwner_[i] != current;
+                anyDisplaced = anyDisplaced || displaced;
+
+                if (displaced && (!slotDisplaced_[i] || ownerChanged))
                 {
-                    displacementVerdictPending_ = true;
-                    interceptedAtDisplacement_  = interceptedDraws_;
+                    slotDisplaced_[i] = true;
+                    log_displaced_slot(slot.name, slot.target, slot.hook, current);
+                    if (i == kHookSetTexture)
+                    {
+                        activate_native_stage_zero_query_mode();
+                        log_line("SetTexture ownership changed; the foreign owner was preserved and narrow GetTexture(0) stage-zero queries are active.");
+                    }
+                    else if (i == kHookCreateTexture)
+                    {
+                        createForwardingObserved_ = false;
+                        log_line("CreateTexture ownership changed; new allocations remain observable only when the foreign owner forwards into SpectralFix.");
+                    }
+                    else
+                    {
+                        drawForwardingObserved_ = false;
+                        correctionLost_ = false;
+                        missedDrawChainWindows_ = 0;
+                        interceptedAtDisplacement_ = interceptedDraws_;
+                        displacementVerdictPending_ = true;
+                        drawChainSampleNotBeforeFrame_ = frames_ + 60;
+                        drawChainSurvivalReported_ = false;
+                        log_line("DrawPrimitiveUP ownership changed; new enlargement is blocked until forwarding into SpectralFix is observed after this displacement.");
+                    }
                 }
-                return;
+                else if (!displaced && slotDisplaced_[i])
+                {
+                    slotDisplaced_[i] = false;
+                    log_line(std::string(slot.name) + " direct ownership recovered without overwriting the former owner.");
+                    if (i == kHookDrawPrimitiveUP)
+                    {
+                        correctionLost_ = false;
+                        displacementVerdictPending_ = false;
+                        missedDrawChainWindows_ = 0;
+                    }
+                }
+                lastObservedHookOwner_[i] = current;
             }
-
-            hookDisplaced_        = true;
-            allowNewEnlargements_ = false;
-            log_displaced_hooks();
-
-            // Tap and center-composite correction key off stage-zero identity. Once
-            // that identity can go stale, they could adjust an unrelated draw, so they
-            // stop here. Downsample correction of a marked target does not depend on
-            // stage-zero tracking and deliberately continues.
+            hookDisplaced_ = anyDisplaced;
             if (!stage_zero_tracking_trustworthy())
             {
-                auraFeaturesEnabled_  = false;
                 trackedStageZeroAura_ = false;
                 trackedStageZeroSize_ = 0;
-                log_line("Stage-zero tracking is no longer trustworthy; tap and center-composite correction stopped to avoid adjusting unrelated draws.");
             }
-
-            if (!enlargementPublished_)
-            {
-                log_line("HOOK DISPLACED: another component owns a required D3D8 slot. SpectralFix left that owner in place. Nothing had been enlarged, so stock rendering is retained.");
-                chat("SpectralFix hit a Direct3D hook conflict before it changed anything. Stock rendering retained; restart the client.");
-                return;
-            }
-
-            if (slot_is_ours(kHookDrawPrimitiveUP))
-            {
-                drawChainSurvivalReported_ = true;
-                log_line("HOOK DISPLACED: the DrawPrimitiveUP slot is still owned by SpectralFix, so correction of the live enlarged allocation continues.");
-                chat("SpectralFix hit a Direct3D hook conflict. The current aura remains corrected; restart the client when convenient.");
-                return;
-            }
-
-            // Whether correction survives depends on whether anything still calls our
-            // DrawPrimitiveUP hook. Draws counted before this moment prove nothing.
-            // Keep sampling while a foreign hook owns the slot: a later chain change
-            // must not silently strand the allocation after one successful sample.
-            displacementVerdictPending_ = true;
-            interceptedAtDisplacement_  = interceptedDraws_;
-            log_line("HOOK DISPLACED: another component owns a required D3D8 slot. SpectralFix left that owner in place; no further allocations will be enlarged, and draw-chain forwarding is being monitored.");
         }
 
         void resolve_displacement_verdict()
         {
+            drawChainSampleNotBeforeFrame_ = frames_ + 60;
             const auto sample = evaluate_draw_chain_sample(
                 slot_is_ours(kHookDrawPrimitiveUP),
                 interceptedDraws_,
@@ -600,15 +623,20 @@ namespace spectralfix
             if (sample.health == DrawChainHealth::owned)
             {
                 displacementVerdictPending_ = false;
+                correctionLost_ = false;
                 return;
             }
             if (sample.health == DrawChainHealth::active)
             {
+                drawForwardingObserved_ = true;
+                lastDrawForwardingFrame_ = frames_;
+                correctionLost_ = false;
                 if (!drawChainSurvivalReported_)
                 {
                     drawChainSurvivalReported_ = true;
-                    log_line("HOOK DISPLACED: SpectralFix is still in the draw chain; correction of the live enlarged allocation continues under continuous monitoring.");
-                    chat("SpectralFix hit a Direct3D hook conflict. The current aura keeps rendering correctly; restart the client when convenient.");
+                    log_line("DrawPrimitiveUP forwarding into SpectralFix was observed after displacement; later candidate allocations may recover while the evidence remains recent.");
+                    if (enlargementPublished_)
+                        chat("SpectralFix detected a Direct3D hook change, but required draw correction is still forwarding correctly.");
                 }
                 interceptedAtDisplacement_ = interceptedDraws_;
                 return;
@@ -625,9 +653,14 @@ namespace spectralfix
             // correct the draws into it. Say so plainly instead of leaving the user to
             // wonder why the aura looks wrong.
             correctionLost_ = true;
-            log_line("HOOK DISPLACED: SpectralFix received no DrawPrimitiveUP calls for three consecutive monitoring windows and can no longer confirm correction of the allocation it already enlarged. The aura may render incorrectly until the client is restarted.");
-            chat("SpectralFix can no longer confirm that its Direct3D draw hook is active.");
-            chat("Exit the entire client now; the enlarged aura may render incorrectly until you do.");
+            drawForwardingObserved_ = false;
+            log_line("DrawPrimitiveUP forwarding evidence expired after three consecutive quiet monitoring windows. New enlargement is blocked.");
+            if (enlargementPublished_)
+            {
+                log_line("HOOK DISPLACED: SpectralFix can no longer confirm correction of the allocation it already enlarged. The aura may render incorrectly until the client is restarted.");
+                chat("SpectralFix can no longer confirm that its Direct3D draw hook is active.");
+                chat("Exit the entire client now; the enlarged aura may render incorrectly until you do.");
+            }
         }
 
         HRESULT handle_draw_primitive_up(
@@ -639,7 +672,23 @@ namespace spectralfix
             const UINT stride)
         {
             ++interceptedDraws_;
-            if (device_ == nullptr || device != device_ || original == nullptr
+            refresh_hook_health();
+            if (!slot_is_ours(kHookDrawPrimitiveUP))
+            {
+                const bool recovering = correctionLost_;
+                drawForwardingObserved_ = true;
+                lastDrawForwardingFrame_ = frames_;
+                correctionLost_ = false;
+                if (recovering)
+                {
+                    pendingDrawForwardingRecovery_ = true;
+                    missedDrawChainWindows_ = 0;
+                    displacementVerdictPending_ = true;
+                    drawChainSampleNotBeforeFrame_ = frames_ + 60;
+                }
+            }
+
+            if (!known_runtime_device(device) || original == nullptr
                 || vertexData == nullptr)
                 return original != nullptr
                     ? original(device, primitiveType, primitiveCount, vertexData, stride)
@@ -649,7 +698,9 @@ namespace spectralfix
             // keep being corrected for as long as the client draws into it, whatever
             // else has been switched off. SpectralFix goes fully inert only when it
             // never published an enlargement in the first place.
-            if (!enlargementPublished_ && !auraFeaturesEnabled_)
+            const auto capabilities = runtime_capabilities(false);
+            if (!enlargementPublished_
+                && (!auraFeaturesEnabled_ || !capabilities.applyOptionalAppearance))
                 return original(device, primitiveType, primitiveCount, vertexData, stride);
 
             const auto count = vertex_count(primitiveType, primitiveCount);
@@ -689,7 +740,7 @@ namespace spectralfix
                     if (depthNull && activity.dsNullUpDraws >= 4
                         && selectorVerificationPending_)
                     {
-                        const bool matches = selector_identity_matches(
+                        const auto match = evaluate_selector_match(
                             selector_.moduleTimestamp,
                             selector_.moduleSize,
                             selector_.callerRva,
@@ -700,6 +751,8 @@ namespace spectralfix
                             targetMarker.callerRva,
                             targetMarker.stackHash,
                             targetMarker.signatureOrdinal);
+                        lastSelectorMatch_ = match;
+                        const bool matches = selector_match_is_compatible(match);
                         const auto decision = evaluate_selector_activity(true, matches);
                         selectorVerificationPending_ = false;
                         if (decision == SelectorActivityDecision::confirmed)
@@ -713,6 +766,19 @@ namespace spectralfix
                             auraFeaturesEnabled_            = false;
                             pendingMismatchMarker_          = targetMarker;
                             pendingSelectorMismatchWarning_ = true;
+                            std::ostringstream mismatch;
+                            mismatch << "Selector activity mismatch: " << selector_match_name(match)
+                                << " selected[timestamp=0x" << std::hex << std::uppercase
+                                << selector_.moduleTimestamp << " size=0x" << selector_.moduleSize
+                                << " caller=0x" << selector_.callerRva << " stack=0x"
+                                << selector_.stackHash << std::dec << " ordinal="
+                                << selector_.signatureOrdinal << "] observed[timestamp=0x"
+                                << std::hex << targetMarker.moduleTimestamp << " size=0x"
+                                << targetMarker.moduleSize << " caller=0x" << targetMarker.callerRva
+                                << " stack=0x" << targetMarker.stackHash << std::dec
+                                << " ordinal=" << targetMarker.signatureOrdinal
+                                << "]; conflicting nonzero evidence is never treated as a fallback match.";
+                            log_line(mismatch.str());
                         }
                     }
                     else if (!selector_.valid && !selectorLearnedThisRun_ && depthNull
@@ -745,7 +811,7 @@ namespace spectralfix
                 ++unmarkedBlurDraws_;
             }
 
-            if (!auraFeaturesEnabled_)
+            if (!auraFeaturesEnabled_ || !capabilities.applyOptionalAppearance)
                 return original(device, primitiveType, primitiveCount, vertexData, stride);
 
             auto stageZeroSize = trackedStageZeroSize_;
@@ -970,6 +1036,74 @@ namespace spectralfix
             return true;
         }
 
+        bool known_runtime_device(IDirect3DDevice8* device) const
+        {
+            return device != nullptr && (device == device_ || device == acceptedDeviceAlias_);
+        }
+
+        DeviceIdentityResult classify_device_identity(IDirect3DDevice8* device) const
+        {
+            if (device == nullptr || device_ == nullptr)
+                return DeviceIdentityResult::unavailable;
+            if (device == device_)
+                return DeviceIdentityResult::exactPointer;
+
+            IUnknown* expectedIdentity = nullptr;
+            IUnknown* observedIdentity = nullptr;
+            const auto expectedResult = device_->QueryInterface(
+                IID_IUnknown, reinterpret_cast<void**>(&expectedIdentity));
+            const auto observedResult = device->QueryInterface(
+                IID_IUnknown, reinterpret_cast<void**>(&observedIdentity));
+            const bool available = SUCCEEDED(expectedResult) && expectedIdentity != nullptr
+                && SUCCEEDED(observedResult) && observedIdentity != nullptr;
+            const bool same = available && expectedIdentity == observedIdentity;
+            if (observedIdentity != nullptr)
+                observedIdentity->Release();
+            if (expectedIdentity != nullptr)
+                expectedIdentity->Release();
+            if (!available)
+                return DeviceIdentityResult::unavailable;
+            return same
+                ? DeviceIdentityResult::canonicalComIdentity
+                : DeviceIdentityResult::mismatch;
+        }
+
+        RuntimeCapabilities runtime_capabilities(const bool createCallbackActive) const
+        {
+            const bool createActive = createCallbackActive
+                || slot_is_ours(kHookCreateTexture)
+                || createForwardingObserved_;
+            return evaluate_runtime_capabilities(RuntimeCapabilityInput{
+                createActive,
+                slot_is_ours(kHookDrawPrimitiveUP),
+                drawForwardingObserved_,
+                correctionLost_,
+                slot_is_ours(kHookSetTexture),
+                nativeStageZeroQueryMode_,
+                allowNewEnlargements_ && !targetUnsupported_,
+                frames_,
+                lastDrawForwardingFrame_,
+            });
+        }
+
+        void note_candidate_context(const CreatePlan& plan)
+        {
+            if (plan.contextDecision == CandidateContextDecision::observeOnly)
+                ++observeOnlyCandidates_;
+            const auto index = static_cast<size_t>(plan.contextDecision);
+            if (index < candidateDecisionLogged_.size() && candidateDecisionLogged_[index])
+                return;
+            if (index < candidateDecisionLogged_.size())
+                candidateDecisionLogged_[index] = true;
+
+            std::ostringstream out;
+            out << "Candidate context: decision=" << candidate_context_name(plan.contextDecision)
+                << " device=" << device_identity_name(plan.deviceIdentity)
+                << " caller_rva=0x" << std::hex << std::uppercase << plan.callerRva
+                << " stack_hash=0x" << plan.stackHash << std::dec;
+            log_line(out.str());
+        }
+
         CreatePlan before_create(
             IDirect3DDevice8* device,
             const UINT width,
@@ -995,14 +1129,46 @@ namespace spectralfix
             if (!candidateShape)
                 return plan;
 
+            ++candidateShapedAllocations_;
+            refresh_hook_health();
+            if (!slot_is_ours(kHookCreateTexture))
+            {
+                createForwardingObserved_ = true;
+                lastCreateForwardingFrame_ = frames_;
+                ++forwardedCreateCallbacks_;
+            }
             plan.callerRva   = address_rva(caller);
             plan.stackHash   = capture_stack_hash();
-            const bool deviceMatches = device_ != nullptr && device == device_;
-            if (!candidate_context_is_trusted(deviceMatches, plan.stackHash))
+            if (plan.callerRva == 0)
+                ++callerRvaZeroCount_;
+            if (plan.stackHash == 0)
+                ++stackHashZeroCount_;
+            if (plan.callerRva == 0 && plan.stackHash == 0)
+                ++bothIdentityZeroCount_;
+
+            plan.deviceIdentity = classify_device_identity(device);
+            switch (plan.deviceIdentity)
+            {
+                case DeviceIdentityResult::exactPointer: ++exactDevicePointerMatches_; break;
+                case DeviceIdentityResult::canonicalComIdentity:
+                    ++canonicalDeviceIdentityMatches_;
+                    acceptedDeviceAlias_ = device;
+                    break;
+                case DeviceIdentityResult::mismatch: ++wrongDeviceRejections_; break;
+                default: ++deviceIdentityUnavailableCount_; break;
+            }
+            plan.contextDecision = evaluate_candidate_context(
+                plan.deviceIdentity, plan.callerRva, plan.stackHash);
+            note_candidate_context(plan);
+            if (!candidate_context_is_trusted(plan.contextDecision))
             {
                 ++candidateContextRejections_;
                 return plan;
             }
+            if (plan.contextDecision == CandidateContextDecision::trustedStrong)
+                ++strongCandidatesAccepted_;
+            else
+                ++fallbackCandidatesAccepted_;
 
             plan.candidate   = true;
             plan.candidateId = ++candidateCount_;
@@ -1037,16 +1203,33 @@ namespace spectralfix
                 log_line("Ordinal-1 startup default armed for candidate 1; awaiting aura-activity verification.");
             }
 
-            if (allowNewEnlargements_ && selector_.valid
-                && selector_.moduleTimestamp == module_.timestamp
-                && selector_.moduleSize == module_.size
-                && selector_.callerRva == plan.callerRva
-                && selector_.stackHash == plan.stackHash
-                && selector_.signatureOrdinal == plan.signatureOrdinal)
+            if (selector_.valid)
+            {
+                plan.selectorMatch = evaluate_selector_match(
+                    selector_.moduleTimestamp, selector_.moduleSize,
+                    selector_.callerRva, selector_.stackHash,
+                    selector_.signatureOrdinal, module_.timestamp, module_.size,
+                    plan.callerRva, plan.stackHash, plan.signatureOrdinal);
+                lastSelectorMatch_ = plan.selectorMatch;
+            }
+            const auto capabilities = runtime_capabilities(true);
+            if (capabilities.publishNewEnlargement && selector_.valid
+                && selector_match_is_compatible(plan.selectorMatch))
             {
                 plan.resize       = true;
                 plan.actualWidth  = selector_.targetSize;
                 plan.actualHeight = selector_.targetSize;
+            }
+            else if (selector_.valid && selector_match_is_compatible(plan.selectorMatch)
+                && !capabilities.publishNewEnlargement)
+            {
+                ++capabilityBlockedCandidates_;
+                if (targetUnsupported_)
+                    log_line("Candidate matched selector but retained 256x256 because the requested target exceeds device capabilities.");
+                else if (!allowNewEnlargements_)
+                    log_line("Candidate matched selector but retained 256x256 because a session safety gate stopped new enlargement.");
+                else
+                    log_line("Candidate matched selector but retained 256x256 because the current DrawPrimitiveUP correction capability is not proven.");
             }
             return plan;
         }
@@ -1097,9 +1280,12 @@ namespace spectralfix
 
             std::ostringstream out;
             out << "candidate #" << plan.candidateId
+                << " context=" << candidate_context_name(plan.contextDecision)
+                << " device=" << device_identity_name(plan.deviceIdentity)
                 << " caller=0x" << std::hex << std::uppercase << plan.callerRva
                 << " stack=0x" << plan.stackHash << std::dec
                 << " ordinal=" << plan.signatureOrdinal
+                << " selector_match=" << selector_match_name(plan.selectorMatch)
                 << " request=" << plan.requestedWidth << 'x' << plan.requestedHeight
                 << " actual=" << plan.actualWidth << 'x' << plan.actualHeight
                 << " first_hr=0x" << std::hex << std::uppercase << static_cast<uint32_t>(firstResult)
@@ -1123,7 +1309,7 @@ namespace spectralfix
             const DWORD stage,
             IDirect3DBaseTexture8* texture)
         {
-            if (device != device_ || stage != 0)
+            if (!known_runtime_device(device) || stage != 0)
                 return;
 
             ++stageZeroBindings_;
@@ -1387,6 +1573,7 @@ namespace spectralfix
     private:
         IAshitaCore* core_{nullptr};
         IDirect3DDevice8* device_{nullptr};
+        IDirect3DDevice8* acceptedDeviceAlias_{nullptr};
         // One record per hooked vtable slot keeps installation, ownership checks,
         // rollback, and restoration on the same source of truth.
         struct HookSlot
@@ -1399,6 +1586,8 @@ namespace spectralfix
             bool tracked{false};    // False once the slot is deliberately handed back.
         };
         std::array<HookSlot, kHookCount> hooks_{};
+        std::array<bool, kHookCount> slotDisplaced_{};
+        std::array<void*, kHookCount> lastObservedHookOwner_{};
 
         ModuleIdentity module_{};
         Selector selector_{};
@@ -1430,11 +1619,22 @@ namespace spectralfix
         bool releaseRefused_{false};
         bool displacementVerdictPending_{false};
         bool drawChainSurvivalReported_{false};
+        bool createForwardingObserved_{false};
+        bool drawForwardingObserved_{false};
+        bool pendingDrawForwardingRecovery_{false};
         uint64_t interceptedAtDisplacement_{0};
+        uint64_t lastCreateForwardingFrame_{0};
+        uint64_t lastDrawForwardingFrame_{0};
+        uint64_t drawChainSampleNotBeforeFrame_{0};
         uint32_t missedDrawChainWindows_{0};
         bool targetUnsupported_{false};
         bool targetCapsKnown_{false};
         bool modulePinned_{false};
+        DWORD modulePinError_{ERROR_SUCCESS};
+        std::string modulePinMethod_{"none"};
+        bool wineDetected_{false};
+        std::string wineVersion_{};
+        std::string d3d8ModulePath_{"<not recorded>"};
         uint32_t maxTextureWidth_{0};
         uint32_t maxTextureHeight_{0};
         bool nativeStageZeroQueryMode_{false};
@@ -1456,6 +1656,8 @@ namespace spectralfix
         bool pendingFirstOpacity_{false};
         bool pendingFirstComposite_{false};
         bool pendingCompositeStateFailure_{false};
+        SelectorMatchResult lastSelectorMatch_{SelectorMatchResult::insufficientEvidence};
+        std::array<bool, 6> candidateDecisionLogged_{};
         OneShotNotice drawFailureNotice_{};
         OneShotNotice drawExceptionNotice_{};
         OneShotNotice setTextureExceptionNotice_{};
@@ -1465,6 +1667,19 @@ namespace spectralfix
 
         uint64_t frames_{0};
         uint32_t candidateCount_{0};
+        uint64_t candidateShapedAllocations_{0};
+        uint64_t exactDevicePointerMatches_{0};
+        uint64_t canonicalDeviceIdentityMatches_{0};
+        uint64_t wrongDeviceRejections_{0};
+        uint64_t deviceIdentityUnavailableCount_{0};
+        uint64_t callerRvaZeroCount_{0};
+        uint64_t stackHashZeroCount_{0};
+        uint64_t bothIdentityZeroCount_{0};
+        uint64_t strongCandidatesAccepted_{0};
+        uint64_t fallbackCandidatesAccepted_{0};
+        uint64_t observeOnlyCandidates_{0};
+        uint64_t capabilityBlockedCandidates_{0};
+        uint64_t forwardedCreateCallbacks_{0};
         uint64_t signatureTrackingDrops_{0};
         uint64_t activityTrackingDrops_{0};
         uint64_t candidateContextRejections_{0};
@@ -1589,13 +1804,25 @@ namespace spectralfix
                 return true;
 
             HMODULE self = nullptr;
+            ::SetLastError(ERROR_SUCCESS);
             if (!::GetModuleHandleExA(
                     GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                     reinterpret_cast<LPCSTR>(&hook_draw_primitive_up), &self))
+            {
+                modulePinError_ = ::GetLastError();
+                std::ostringstream failure;
+                failure << "Module pinning with GET_MODULE_HANDLE_EX_FLAG_PIN failed: GetLastError="
+                    << modulePinError_ << ". No unproven lifetime fallback was used.";
+                log_line(failure.str());
                 return false;
+            }
             modulePinned_ = self != nullptr;
             if (modulePinned_)
-                log_line("SpectralFix module pinned for process-lifetime hook safety.");
+            {
+                modulePinMethod_ = "GetModuleHandleEx(PIN|FROM_ADDRESS)";
+                log_line("SpectralFix module pinned for process-lifetime hook safety with "
+                    + modulePinMethod_ + ".");
+            }
             return modulePinned_;
         }
 
@@ -1746,6 +1973,11 @@ namespace spectralfix
 
             for (const auto& slot : hooks_)
                 log_hook_installed(slot);
+            for (size_t i = 0; i < kHookCount; ++i)
+            {
+                slotDisplaced_[i] = false;
+                lastObservedHookOwner_[i] = hooks_[i].hook;
+            }
             return true;
         }
 
@@ -1785,41 +2017,21 @@ namespace spectralfix
             }
         }
 
-        // Native Windows D3D8 restores its own SetTexture pointer repeatedly. Hand
-        // the slot back and switch to querying stage zero on demand instead. The
-        // slot is marked untracked, so later ownership checks deliberately skip it.
+        // A displaced SetTexture observer cannot provide reliable current identity.
+        // Query stage zero only for already-classified tap/composite geometry. This
+        // neither overwrites the foreign owner nor changes gOriginalSetTexture, so a
+        // foreign hook that forwards into SpectralFix cannot create a recursive chain.
         bool activate_native_stage_zero_query_mode()
         {
             if (nativeStageZeroQueryMode_)
-                return false;
+                return true;
 
             auto& setTexture = hooks_[kHookSetTexture];
             if (!setTexture.tracked || setTexture.target == nullptr)
                 return false;
-            for (size_t i = 0; i < kHookCount; ++i)
-            {
-                if (i == kHookSetTexture)
-                    continue;
-                const auto& slot = hooks_[i];
-                if (!slot.tracked || slot.target == nullptr || *slot.target != slot.hook)
-                    return false;
-            }
-
             void* const current = *setTexture.target;
             if (current == nullptr || current == setTexture.hook)
                 return false;
-
-            const auto owner = lower_copy(module_path_for_address(current));
-            const bool isWindowsD3D8 = owner.find("\\windows\\system32\\d3d8.dll") != std::string::npos
-                || owner.find("\\windows\\syswow64\\d3d8.dll") != std::string::npos;
-            if (!isWindowsD3D8)
-                return false;
-
-            log_displaced_slot(setTexture.name, setTexture.target, setTexture.hook, current);
-            setTexture.previous = current;
-            publish_original(kHookSetTexture, current);
-            setTexture.tracked = false;
-            setTexture.target  = nullptr;
             trackedStageZeroSize_     = 0;
             trackedStageZeroAura_     = false;
             nativeStageZeroQueryMode_ = true;
@@ -2174,6 +2386,23 @@ namespace spectralfix
                 log_line("spectralfix.ini exists but is incomplete or invalid; observe-only mode retained.");
         }
 
+        void detect_environment()
+        {
+            const auto ntdll = ::GetModuleHandleA("ntdll.dll");
+            if (ntdll == nullptr)
+                return;
+            using WineGetVersionFn = const char*(__cdecl*)();
+            const auto getWineVersion = reinterpret_cast<WineGetVersionFn>(
+                ::GetProcAddress(ntdll, "wine_get_version"));
+            if (getWineVersion == nullptr)
+                return;
+            wineDetected_ = true;
+            const auto version = getWineVersion();
+            wineVersion_ = version != nullptr && version[0] != '\0'
+                ? version
+                : "version unavailable";
+        }
+
         void log_d3d8_module()
         {
             const auto module = ::GetModuleHandleA("d3d8.dll");
@@ -2184,7 +2413,10 @@ namespace spectralfix
             }
             std::array<char, MAX_PATH> path{};
             const auto count = ::GetModuleFileNameA(module, path.data(), static_cast<DWORD>(path.size()));
-            log_line(count == 0 ? "d3d8.dll path unavailable." : "d3d8.dll module: " + std::string(path.data(), count));
+            d3d8ModulePath_ = count == 0
+                ? "<path unavailable>"
+                : std::string(path.data(), count);
+            log_line("d3d8.dll module: " + d3d8ModulePath_);
         }
 
         std::string mode_text() const
@@ -2200,9 +2432,14 @@ namespace spectralfix
             if (displacementVerdictPending_)
                 return "hook displaced; measuring whether the draw hook is still called";
             if (hookDisplaced_)
-                return enlargementPublished_
-                    ? "hook displaced; no new enlargements, enlarged allocation still corrected"
-                    : "disabled after hook displacement";
+            {
+                const auto capabilities = runtime_capabilities(false);
+                if (!capabilities.correctEnlargedDownsample)
+                    return "hook ownership changed; stock rendering retained until draw forwarding is proven";
+                return capabilities.publishNewEnlargement
+                    ? "foreign hook forwarding verified; compatible capability mode active"
+                    : "hook ownership changed; required correction active, new enlargement blocked";
+            }
             if (targetUnsupported_)
                 return "disabled because requested target exceeds device limits";
             if (selectorFromOrdinalDefault_ && selectorVerificationPending_)
@@ -2256,8 +2493,19 @@ namespace spectralfix
             return out.str();
         }
 
+        std::string hook_owner_path(const size_t index) const
+        {
+            if (index >= hooks_.size())
+                return "<invalid>";
+            const auto& slot = hooks_[index];
+            if (!slot.tracked || slot.target == nullptr)
+                return "<untracked>";
+            return module_path_for_address(*slot.target);
+        }
+
         std::string status_text() const
         {
+            const auto capabilities = runtime_capabilities(false);
             std::ostringstream out;
             out << "SpectralFix: " << mode_text()
                 << "; candidates=" << candidateCount_
@@ -2273,12 +2521,22 @@ namespace spectralfix
                 << ", center adjusted=" << centerCompositeAdjusted_
                 << ", center skipped=" << centerCompositeSkipped_
                 << ", draw failures=" << drawFailures_
-                << ", unmarked blur draws=" << unmarkedBlurDraws_ << '.';
+                << ", unmarked blur draws=" << unmarkedBlurDraws_
+                << "; capabilities=new allocation "
+                << (capabilities.observeNewAllocations ? "yes" : "no")
+                << ", required correction "
+                << (capabilities.correctEnlargedDownsample ? "yes" : "no")
+                << ", stage-zero "
+                << (capabilities.observeStageZeroIdentity ? "yes" : "no")
+                << ", new enlargement "
+                << (capabilities.publishNewEnlargement ? "yes" : "no")
+                << ". See spectralfix.log for evidence and hook owners.";
             return out.str();
         }
 
         void log_status(const char* reason)
         {
+            const auto capabilities = runtime_capabilities(false);
             std::ostringstream out;
             out << "status[" << reason << "] frames=" << frames_
                 << " mode=" << mode_text()
@@ -2288,6 +2546,21 @@ namespace spectralfix
                 << " signature_tracking_drops=" << signatureTrackingDrops_
                 << " activity_tracking_drops=" << activityTrackingDrops_
                 << " candidate_context_rejections=" << candidateContextRejections_
+                << " candidate_shaped=" << candidateShapedAllocations_
+                << " device_exact=" << exactDevicePointerMatches_
+                << " device_canonical=" << canonicalDeviceIdentityMatches_
+                << " wrong_device_rejections=" << wrongDeviceRejections_
+                << " device_identity_unavailable=" << deviceIdentityUnavailableCount_
+                << " caller_rva_zero=" << callerRvaZeroCount_
+                << " stack_hash_zero=" << stackHashZeroCount_
+                << " both_identity_zero=" << bothIdentityZeroCount_
+                << " candidates_strong=" << strongCandidatesAccepted_
+                << " candidates_fallback=" << fallbackCandidatesAccepted_
+                << " candidates_observe_only=" << observeOnlyCandidates_
+                << " candidates_capability_blocked=" << capabilityBlockedCandidates_
+                << " create_forwarding_observed=" << (createForwardingObserved_ ? "true" : "false")
+                << " forwarded_create_callbacks=" << forwardedCreateCallbacks_
+                << " last_create_forwarding_frame=" << lastCreateForwardingFrame_
                 << " resized=" << resizedAllocations_
                 << " intercepted=" << interceptedDraws_
                 << " stage0_bindings=" << stageZeroBindings_
@@ -2320,6 +2593,8 @@ namespace spectralfix
                 << " max_texture_height=" << maxTextureHeight_
                 << " target_unsupported=" << (targetUnsupported_ ? "true" : "false")
                 << " module_pinned=" << (modulePinned_ ? "true" : "false")
+                << " pin_method=" << modulePinMethod_
+                << " pin_error=" << modulePinError_
                 << " allow_new_enlargements=" << (allowNewEnlargements_ ? "true" : "false")
                 << " aura_features=" << (auraFeaturesEnabled_ ? "true" : "false")
                 << " enlargement_published=" << (enlargementPublished_ ? "true" : "false")
@@ -2330,7 +2605,14 @@ namespace spectralfix
                 << " release_refused=" << (releaseRefused_ ? "true" : "false")
                 << " displacement_verdict_pending=" << (displacementVerdictPending_ ? "true" : "false")
                 << " draw_chain_missed_windows=" << missedDrawChainWindows_
+                << " draw_forwarding_observed=" << (drawForwardingObserved_ ? "true" : "false")
+                << " last_draw_forwarding_frame=" << lastDrawForwardingFrame_
                 << " stage0_trustworthy=" << (stage_zero_tracking_trustworthy() ? "true" : "false")
+                << " cap_observe_create=" << (capabilities.observeNewAllocations ? "true" : "false")
+                << " cap_correct_downsample=" << (capabilities.correctEnlargedDownsample ? "true" : "false")
+                << " cap_stage0_identity=" << (capabilities.observeStageZeroIdentity ? "true" : "false")
+                << " cap_optional_appearance=" << (capabilities.applyOptionalAppearance ? "true" : "false")
+                << " cap_publish_enlargement=" << (capabilities.publishNewEnlargement ? "true" : "false")
                 << std::defaultfloat
                 << " selector_source="
                 << (selectorFromOrdinalDefault_ ? "ordinal1-default"
@@ -2339,7 +2621,15 @@ namespace spectralfix
                 << (selectorMismatch_ ? "mismatch"
                     : (selectorVerificationPending_ ? "pending"
                         : (selectorVerifiedThisRun_ ? "confirmed" : "not-required")))
+                << " selector_match=" << selector_match_name(lastSelectorMatch_)
                 << " native_stage0_query_mode=" << (nativeStageZeroQueryMode_ ? "true" : "false")
+                << " environment=" << (wineDetected_ ? "wine" : "windows")
+                << " wine_version=\"" << (wineDetected_ ? wineVersion_ : "n/a") << '"'
+                << " ashita_interface=" << ASHITA_INTERFACE_VERSION
+                << " d3d8_path=\"" << d3d8ModulePath_ << '"'
+                << " create_owner=\"" << hook_owner_path(kHookCreateTexture) << '"'
+                << " settexture_owner=\"" << hook_owner_path(kHookSetTexture) << '"'
+                << " draw_owner=\"" << hook_owner_path(kHookDrawPrimitiveUP) << '"'
                 << " log_bytes=" << logBytesWritten_
                 << " log_rotation_failed=" << (logRotationFailedThisRun_ ? "true" : "false")
                 << " hook_rollback_incomplete=" << (hookRollbackIncomplete_ ? "true" : "false")

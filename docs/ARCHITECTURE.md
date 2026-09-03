@@ -18,8 +18,9 @@ SpectralFix hooks three methods on the actual `IDirect3DDevice8` instance:
 1. `CreateTexture` identifies the normalized aura-allocation signature and
    enlarges only the selected ordinal.
 2. `SetTexture` passively records when the exact selected aura resource is bound
-   to stage zero. Native Windows D3D8 can switch to a narrow `GetTexture` query
-   when another component repeatedly restores this observer.
+   to stage zero. If another component owns that slot, SpectralFix preserves it
+   and switches to a narrow `GetTexture(0)` query only on already-classified tap
+   or center-composite geometry.
 3. `DrawPrimitiveUP` corrects the selected downsample and shifted-tap geometry.
    It also recognizes FFXI's separate centered hard-cutout pass and applies the
    configured center opacity with full render-state restoration.
@@ -32,12 +33,28 @@ allocation dimensions and the matching client draw data.
 Across the tested clients, the aura is ordinal 1 of one normalized FFXiMain
 allocation signature. A fresh install optimistically enlarges that ordinal and
 then verifies it from aura-specific activity. If another candidate proves to be
-the aura, SpectralFix saves the corrected selector for that client build, disables
-correction, and requires a full client exit.
+the aura, SpectralFix saves the corrected selector for that client build, stops
+new enlargement and optional appearance changes, retains any correction required
+by a live enlarged allocation, and requires a full client exit.
 
 Private data markers are attached to both the selected texture and its level-zero
 surface. Wrapper paths can use exact dimension fallback only after a selector is
 valid. Native stock-sized textures never use a broad dimension-only match.
+
+Allocation context is explicit evidence rather than a single boolean. Raw device
+pointer equality is the strongest path. Candidate-shaped allocations with a
+different interface pointer may use balanced `QueryInterface(IID_IUnknown)` calls
+to prove canonical COM identity; a shared vtable is never identity. At least one
+FFXiMain source is required: the direct caller RVA, the bounded stack hash, or
+both. With neither, the allocation is counted as observe-only and remains stock.
+
+Saved selectors retain the FFXiMain timestamp, image size, allocation ordinal,
+caller RVA, and stack hash. A caller-only or stack-only selector is valid. Exact
+matching is preferred when both identity fields are available; one unavailable
+field permits an explicit caller or stack fallback. Conflicting nonzero evidence,
+module changes, ordinal changes, and selectors with both identity fields zero are
+rejected and logged by reason. Existing v1.01/v1.02 version-1 INI files remain
+readable.
 
 Ashita does not expose the live Blur Effect toggle through its public plugin SDK.
 SpectralFix deliberately does not infer it from missing draw activity or startup
@@ -55,26 +72,37 @@ place because it may have saved SpectralFix as its previous function; installing
 SpectralFix above it could create a recursive forwarding cycle. Unknown ownership
 therefore fails closed.
 
-When another component remains above SpectralFix's DrawPrimitiveUP hook, one
-successful sample does not permanently prove the chain is safe. SpectralFix keeps
-watching intercepted draws every sixty presented frames. Activity resets the
-watchdog; three consecutive windows without a draw produce an immediate-exit
-warning. If SpectralFix still owns the draw slot directly, no sampling verdict is
-needed.
+Hook capability is tracked per slot. A displaced SetTexture observer activates
+the query fallback without disabling CreateTexture observation or required
+downsample correction. A CreateTexture callback received through a foreign owner
+is current evidence that its chain forwarded for that call. DrawPrimitiveUP is
+stricter: new enlargement requires direct ownership or forwarding observed after
+the latest displacement and within the bounded evidence window.
 
-The three slots are held in one table, and displacement plus draw-chain watchdog
-decisions live in `hook_policy.hpp` without touching memory, so they are unit
-tested. A slot handed back on purpose, such as the SetTexture observer released to
-native Windows D3D8, is marked untracked and skipped by later ownership checks.
+One successful DrawPrimitiveUP sample does not permanently prove the chain is
+safe. SpectralFix watches intercepted draws every sixty presented frames.
+Activity resets the watchdog; three consecutive windows without a draw expire
+the evidence. If a live enlarged allocation exists, that loss produces an
+immediate-exit warning. Later intercepted forwarding can recover capability for
+later allocations. If SpectralFix owns the draw slot directly, no sampling verdict
+is needed.
 
-Candidate allocations must come from the exact device Ashita supplied and must
-have a nonzero FFXiMain stack identity. Matching allocations from another shared-
-vtable device, or from a call path that cannot be tied to FFXiMain, remain stock.
+The three slots are held in one table, and per-hook capability plus draw-chain
+watchdog decisions live in `hook_policy.hpp` without touching memory, so they are
+unit tested. SpectralFix never writes itself back above an unknown later owner and
+never replaces an original-function pointer with a foreign top-level hook that
+may already forward into SpectralFix.
 
 Once hooks are published, the SpectralFix module is pinned for the process
 lifetime. This keeps its passthrough code mapped even if another component retains
 SpectralFix in a hook chain. In-process unload and reload are deliberately refused;
 users must exit the client.
+
+The primary lifetime mechanism is
+`GetModuleHandleEx(PIN | FROM_ADDRESS)`. Failure records `GetLastError` and leaves
+all hooks unpublished. No reference-retention fallback is enabled because it has
+not yet been demonstrated in the supported live lifecycle; lifetime safety is not
+relaxed merely for Wine.
 
 ## Failing without corrupting the frame
 

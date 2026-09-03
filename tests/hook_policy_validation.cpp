@@ -126,5 +126,86 @@ int main()
         return 12;
     }
 
+    RuntimeCapabilityInput capability{};
+    capability.createCallbackActive = true;
+    capability.drawSlotOwned = true;
+    capability.setTextureSlotOwned = true;
+    capability.baseEnlargementAllowed = true;
+    auto runtime = evaluate_runtime_capabilities(capability);
+    if (!runtime.publishNewEnlargement || !runtime.correctEnlargedDownsample
+        || !runtime.observeStageZeroIdentity || !runtime.applyOptionalAppearance)
+    {
+        std::cerr << "directly owned hooks did not expose full capabilities\n";
+        return 13;
+    }
+
+    // SetTexture loss only switches stage-zero identity to the narrow query path;
+    // allocation observation and required draw correction remain independent.
+    capability.setTextureSlotOwned = false;
+    capability.stageZeroQueryFallback = true;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (!runtime.publishNewEnlargement || !runtime.observeStageZeroIdentity
+        || !runtime.applyOptionalAppearance)
+    {
+        std::cerr << "SetTexture query fallback disabled unrelated capabilities\n";
+        return 14;
+    }
+
+    capability.drawSlotOwned = false;
+    capability.drawForwardingObserved = false;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (runtime.publishNewEnlargement || runtime.correctEnlargedDownsample)
+    {
+        std::cerr << "unknown DrawPrimitiveUP forwarding permitted enlargement\n";
+        return 15;
+    }
+
+    capability.currentFrame = 100;
+    capability.lastDrawForwardingFrame = 99;
+    capability.drawForwardingObserved = true;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (!runtime.drawForwardingRecent || !runtime.publishNewEnlargement)
+    {
+        std::cerr << "recent DrawPrimitiveUP forwarding did not recover enlargement\n";
+        return 16;
+    }
+
+    capability.drawForwardingLost = true;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (runtime.publishNewEnlargement || runtime.correctEnlargedDownsample)
+    {
+        std::cerr << "lost DrawPrimitiveUP forwarding still permitted enlargement\n";
+        return 17;
+    }
+
+    capability.drawForwardingLost = false;
+    capability.currentFrame = 101;
+    capability.lastDrawForwardingFrame = 101;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (!runtime.publishNewEnlargement || !runtime.correctEnlargedDownsample)
+    {
+        std::cerr << "renewed DrawPrimitiveUP evidence did not recover capabilities\n";
+        return 18;
+    }
+
+    capability.currentFrame = kDrawForwardingFreshFrames + 200;
+    capability.lastDrawForwardingFrame = 1;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (runtime.drawForwardingRecent || runtime.publishNewEnlargement)
+    {
+        std::cerr << "stale DrawPrimitiveUP evidence still permitted enlargement\n";
+        return 19;
+    }
+
+    capability.drawSlotOwned = true;
+    capability.createCallbackActive = false;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (runtime.observeNewAllocations || runtime.publishNewEnlargement
+        || !runtime.correctEnlargedDownsample)
+    {
+        std::cerr << "CreateTexture loss incorrectly disabled live correction\n";
+        return 20;
+    }
+
     return 0;
 }

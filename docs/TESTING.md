@@ -11,21 +11,24 @@ The test suite verifies:
 - Downsample, tap-spread, opacity, center-geometry, and half-pixel rewrites at
   1024, 2048, and 4096.
 - Ordinal-1 startup selection, activity confirmation, mismatch handling, and
-  client-specific selector validation.
+  client-specific selector validation, including exact, caller-only, stack-only,
+  module/ordinal mismatch, conflicting identity, and insufficient evidence.
 - The spectralfix.ini round trip, parsing of existing v1.01 files including CRLF
   and inline comments, settings-only persistence before a selector is learned,
   rejection of out-of-range and negative values, and silent tolerance of unknown
   keys.
-- Hook table decisions: displacement detection, deliberately released slots, and
-  the draw-chain watchdog's activity, quiet-window, confirmed-loss, and directly-
-  owned-slot decisions. Unknown late owners are preserved rather than overwritten.
+- Hook table decisions: displacement detection, SetTexture query fallback,
+  independent CreateTexture/SetTexture/DrawPrimitiveUP capabilities, recovery from
+  current forwarding evidence, stale/lost evidence, and the draw-chain watchdog.
+  Unknown late owners are preserved rather than overwritten.
 - Runtime safety policy through a fake vtable: complete publication, successful
   rollback, write failure after partial publication, rollback failure with accurate
   retained ownership, conventional forwarding-hook preservation, shared-vtable
   secondary-device rejection, one-shot failure notices, and release policy before
   and after enlargement.
-- Allocation-context policy: only the Ashita device with a nonzero FFXiMain stack
-  identity can participate in candidate selection.
+- Allocation-context policy: exact device plus caller/stack, caller-only, and
+  stack-only evidence; canonical COM identity fallback; wrong logical device,
+  shared-vtable-only identity, and both FFXiMain sources absent.
 - Center-composite state capture, application, and restoration, including full
   restoration while a faulting draw unwinds and after a partially applied state
   change.
@@ -51,6 +54,19 @@ check; the tested atom0s proxy initializes only inside FFXI.
 | 4.30 | `2e4b9c86de538ecfedabab918537c550d6378aaa` |
 
 These revisions exactly match the `Ashita.h` files in the two tested client SDKs.
+
+## Unreleased compatibility-pass verification
+
+On 2026-09-03, `scripts/Build-All.ps1` completed against both pinned SDKs. Ashita
+4.16 passed 7/7 CTest jobs and Ashita 4.30 passed 7/7, for 14/14 total. Both
+Win32 Release DLLs compiled under `/W4 /WX`; export smoke reported plugin version
+1.02 and the expected interface for each build. Each generated package contained
+only `BUILD.txt`, `INSTALL.txt`, `LICENSE.txt`, and `spectralfix.dll`.
+
+The wrapper-smoke executable compiled for both ABIs, but this pass did not load an
+external D3D8 wrapper because no runtime wrapper path is part of the repository
+verification input. No live FFXI, Windows-wrapper, or Wine runtime result is
+claimed for the compatibility pass.
 
 ## Runtime evidence before standalone extraction
 
@@ -118,3 +134,34 @@ The local, CatsEye, and Horizon runtime regressions above were the accepted v1.0
 release evidence. A separate 30-60 minute soak was not required. A coordinated
 50-aura crowd test is not practical and remains a documented limit rather than a
 release blocker.
+
+## Compatibility-pass manual runtime plan
+
+This pass has host-side and dual-ABI build evidence only until the following live
+checks are completed. A successful Windows check does not prove Wine behavior.
+
+Windows:
+
+1. Test fresh configuration with native D3D8, then fresh and saved configurations
+   with dgVoodoo2 on Ashita 4.16 and 4.30.
+2. Load from the startup script before normal user plugins/addons. Summon,
+   dismiss/resummon, zone, relog, and toggle Blur Effect off and back on.
+3. Repeat with a late SetTexture owner, a late forwarding DrawPrimitiveUP owner,
+   and a late non-forwarding DrawPrimitiveUP owner. Confirm unknown owners remain
+   installed and only the capabilities that depend on them stop or recover.
+4. Attempt direct unload and `UnloadAll` with a live enlarged allocation; confirm
+   refusal, retained correction, and clean process exit.
+
+Wine:
+
+1. Record Wine version/runner, 32-bit prefix and process configuration, Ashita
+   interface package, and D3D8 implementation or wrapper.
+2. Start with fresh `spectralfix.ini`, startup-script loading, and Blur Effect on.
+3. Capture `/spectralfix status` before and after summoning an aura and preserve
+   the complete `spectralfix.log` from initialization through the test.
+4. If a selector is learned, fully exit and repeat once. Verify the log reports
+   caller/stack evidence, device identity, selector match strength, per-hook
+   owners/capabilities, and the precise reason for any stock-rendering fallback.
+
+Wine support remains experimental until this plan is run in a real Wine-hosted
+FFXI/Ashita process.

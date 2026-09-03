@@ -2,6 +2,23 @@
 
 All notable user-facing changes are recorded here.
 
+## Unreleased
+
+- Accept evidence-backed allocation fallbacks when FFXiMain supplies only a direct
+  caller or only a usable stack fingerprint, and recognize alternate interface
+  pointers only when canonical COM identity proves they are the same device.
+- Keep existing version-1 selectors compatible while classifying exact,
+  caller-only, stack-only, conflicting, module, and ordinal match outcomes.
+- Track CreateTexture, SetTexture, and DrawPrimitiveUP capabilities separately.
+  SetTexture loss uses a narrow stage-zero query; new enlargement still requires
+  directly owned or recently observed DrawPrimitiveUP correction.
+- Preserve unknown foreign hook owners without re-chaining. Forwarding capability
+  can recover after current evidence appears and expires under the existing quiet
+  watchdog when the chain stops calling SpectralFix.
+- Expand bounded diagnostics with Windows/Wine environment, device and allocation
+  evidence, selector match strength, hook owners/capabilities, and module-pinning
+  method/error details. Wine compatibility remains experimental pending live tests.
+
 ## 1.02 - 2026-08-29
 
 - Keep every live enlarged aura safely corrected through selector mismatches, plugin

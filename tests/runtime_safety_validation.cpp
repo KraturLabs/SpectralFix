@@ -187,15 +187,16 @@ int main()
         return 8;
     }
 
-    // Two devices can share a vtable. Only pointer identity with Ashita's actual
-    // device may participate in allocation selection.
+    // Two devices can share a vtable. Shared code is not canonical COM identity.
     std::array<void*, 3> sharedTable{
         address(kBaseAddress), address(kBaseAddress + 0x10), address(kBaseAddress + 0x20)};
     FakeDevice ashitaDevice{sharedTable.data()};
     FakeDevice secondaryDevice{sharedTable.data()};
     if (ashitaDevice.vtable != secondaryDevice.vtable
-        || !candidate_context_is_trusted(&ashitaDevice == &ashitaDevice, 0x1234)
-        || candidate_context_is_trusted(&secondaryDevice == &ashitaDevice, 0x1234))
+        || !candidate_context_is_trusted(evaluate_candidate_context(
+            DeviceIdentityResult::exactPointer, 0x10, 0x1234))
+        || candidate_context_is_trusted(evaluate_candidate_context(
+            DeviceIdentityResult::mismatch, 0x10, 0x1234)))
     {
         std::cerr << "shared-vtable secondary device entered candidate selection\n";
         return 9;

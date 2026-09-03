@@ -15,11 +15,10 @@ namespace spectralfix
         const uint32_t signatureOrdinal,
         const uint32_t targetSize)
     {
-        (void)callerRva;
         return version == kSettingsVersion
             && moduleTimestamp != 0
             && moduleSize != 0
-            && stackHash != 0
+            && (callerRva != 0 || stackHash != 0)
             && signatureOrdinal != 0
             && target_size_supported(targetSize);
     }
