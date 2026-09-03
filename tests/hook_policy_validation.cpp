@@ -267,5 +267,33 @@ int main()
         return 26;
     }
 
+    // If neither SetTexture observation nor the stage-zero query fallback is
+    // available, marked-target activity and required downsample correction must
+    // still reach the core draw path. Optional tap/composite work remains blocked.
+    capability = RuntimeCapabilityInput{};
+    capability.createCallbackActive = true;
+    capability.drawSlotOwned = true;
+    capability.baseEnlargementAllowed = true;
+    runtime = evaluate_runtime_capabilities(capability);
+    const auto drawProcessing = evaluate_draw_processing(false, true, runtime);
+    const auto disabledWithoutEnlargement = evaluate_draw_processing(false, false, runtime);
+    const auto disabledWithEnlargement = evaluate_draw_processing(true, false, runtime);
+    const auto strongerIdentity = evaluate_selector_match(
+        1, 2, 3, 0, 1, 1, 2, 3, 4, 1);
+    if (!runtime.correctEnlargedDownsample
+        || runtime.observeStageZeroIdentity
+        || runtime.applyOptionalAppearance
+        || !drawProcessing.processMarkedTargetCore
+        || drawProcessing.applyOptionalAppearance
+        || disabledWithoutEnlargement.processMarkedTargetCore
+        || disabledWithoutEnlargement.applyOptionalAppearance
+        || !disabledWithEnlargement.processMarkedTargetCore
+        || disabledWithEnlargement.applyOptionalAppearance
+        || !selector_match_requires_learning(strongerIdentity))
+    {
+        std::cerr << "missing stage-zero identity blocked core draw processing or allowed optional appearance\n";
+        return 27;
+    }
+
     return 0;
 }

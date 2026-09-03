@@ -190,6 +190,23 @@ namespace spectralfix
         };
     }
 
+    struct DrawProcessingDecision
+    {
+        bool processMarkedTargetCore{false};
+        bool applyOptionalAppearance{false};
+    };
+
+    constexpr DrawProcessingDecision evaluate_draw_processing(
+        const bool enlargementPublished,
+        const bool auraFeaturesEnabled,
+        const RuntimeCapabilities& capabilities)
+    {
+        return {
+            enlargementPublished || auraFeaturesEnabled,
+            auraFeaturesEnabled && capabilities.applyOptionalAppearance,
+        };
+    }
+
     // A foreign function at the top of the DrawPrimitiveUP slot can still be
     // safely forwarding to SpectralFix. Treat one quiet sample as inconclusive;
     // only consecutive windows with presented frames but no intercepted draws

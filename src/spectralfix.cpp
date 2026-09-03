@@ -751,8 +751,9 @@ namespace spectralfix
             // else has been switched off. SpectralFix goes fully inert only when it
             // never published an enlargement in the first place.
             const auto capabilities = runtime_capabilities(false);
-            if (!enlargementPublished_
-                && (!auraFeaturesEnabled_ || !capabilities.applyOptionalAppearance))
+            const auto drawProcessing = evaluate_draw_processing(
+                enlargementPublished_, auraFeaturesEnabled_, capabilities);
+            if (!drawProcessing.processMarkedTargetCore)
                 return original(device, primitiveType, primitiveCount, vertexData, stride);
 
             const auto count = vertex_count(primitiveType, primitiveCount);
@@ -876,7 +877,7 @@ namespace spectralfix
                 ++unmarkedBlurDraws_;
             }
 
-            if (!auraFeaturesEnabled_ || !capabilities.applyOptionalAppearance)
+            if (!drawProcessing.applyOptionalAppearance)
                 return original(device, primitiveType, primitiveCount, vertexData, stride);
 
             auto stageZeroSize = trackedStageZeroSize_;
