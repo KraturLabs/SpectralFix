@@ -60,7 +60,7 @@ stronger identity for the next full launch. Each session binds a compatible sele
 to one candidate ID, and markers, confirmation, and dimension fallbacks must carry
 that same ID. Conflicting nonzero evidence,
 module changes, ordinal changes, and selectors with both identity fields zero are
-rejected and logged by reason. Existing v1.01/v1.02 version-1 INI files remain
+rejected and logged by reason. Existing v1.01-v1.03 version-1 INI files remain
 readable.
 
 Ashita does not expose the live Blur Effect toggle through its public plugin SDK.

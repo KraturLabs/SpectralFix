@@ -60,8 +60,7 @@ client before replacing or removing the DLL.
 SpectralFix remains a 32-bit Windows Ashita plugin. Linux use means loading the
 same Windows DLL inside a 32-bit FFXI/Ashita process hosted by Wine; there is no
 native Linux build and the Ashita ABI is unchanged. Wine compatibility is
-experimental until this compatibility pass is exercised in a real Wine-hosted
-client.
+experimental because v1.03 was not tested in a live Wine-hosted client.
 
 The plugin can use a direct FFXiMain caller when Wine or a wrapper cannot produce
 a usable stack fingerprint, and it can recognize two interface pointers that

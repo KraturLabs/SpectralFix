@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(SpectralFix VERSION 1.02 LANGUAGES CXX)
+project(SpectralFix VERSION 1.03 LANGUAGES CXX)
 
 if (NOT WIN32)
     message(FATAL_ERROR "SpectralFix is a 32-bit Windows Ashita plugin.")

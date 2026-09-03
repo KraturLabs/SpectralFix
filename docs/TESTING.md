@@ -60,17 +60,29 @@ check; the tested atom0s proxy initializes only inside FFXI.
 
 These revisions exactly match the `Ashita.h` files in the two tested client SDKs.
 
-## Unreleased compatibility-pass verification
+## v1.03 compatibility verification
 
 On 2026-09-03, `scripts/Build-All.ps1` completed against both pinned SDKs. Ashita
 4.16 passed 8/8 CTest jobs and Ashita 4.30 passed 8/8, for 16/16 total. Both
 Win32 Release DLLs compiled under `/W4 /WX`; export smoke reported plugin version
-1.02 and the expected interface for each build. Each generated package contained
+1.03 and the expected interface for each build. Each generated package contained
 only `BUILD.txt`, `INSTALL.txt`, `LICENSE.txt`, and `spectralfix.dll`.
 
 The wrapper-smoke executable compiled for both ABIs. Both utilities loaded
 `C:\Windows\SysWOW64\d3d8.dll` and reported `Direct3DCreate8 succeeded`. This is
 a loader/export check, not a live FFXI or Wine runtime claim.
+
+## v1.03 live Windows regression
+
+After the final stage-zero/core-processing correction, the maintainer completed
+the live Windows release regression with both an existing saved configuration and
+a fresh configuration followed by the required full restart. Aura summon,
+dismissal, resummon, and zoning all passed. No visual errors, warnings, selector
+failures, hook failures, or regressions were observed.
+
+No live Wine-hosted FFXI test was completed for v1.03. Wine compatibility remains
+experimental; the successful Windows regression does not establish Wine, Proton,
+DXVK, D8VK, or wrapper-specific support.
 
 ## Runtime evidence before standalone extraction
 
@@ -139,10 +151,11 @@ release evidence. A separate 30-60 minute soak was not required. A coordinated
 50-aura crowd test is not practical and remains a documented limit rather than a
 release blocker.
 
-## Compatibility-pass manual runtime plan
+## Additional compatibility runtime coverage
 
-This pass has host-side and dual-ABI build evidence only until the following live
-checks are completed. A successful Windows check does not prove Wine behavior.
+The v1.03 Windows release regression is recorded above. The following
+environment-specific checks remain useful for future compatibility work. A
+successful Windows check does not prove Wine behavior.
 
 Windows:
 

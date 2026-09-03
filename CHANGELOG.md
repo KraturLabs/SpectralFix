@@ -2,7 +2,7 @@
 
 All notable user-facing changes are recorded here.
 
-## Unreleased
+## 1.03 - 2026-09-03
 
 - Accept evidence-backed allocation fallbacks when FFXiMain supplies only a direct
   caller or only a usable stack fingerprint, and recognize alternate interface
@@ -16,7 +16,9 @@ All notable user-facing changes are recorded here.
   candidate ID prevents two compatible candidates from being enlarged or confirmed.
 - Track CreateTexture, SetTexture, and DrawPrimitiveUP capabilities separately.
   SetTexture loss uses a narrow stage-zero query; new enlargement still requires
-  directly owned or recently observed DrawPrimitiveUP correction.
+  directly owned or recently observed DrawPrimitiveUP correction. If stage-zero
+  identity is unavailable, selector activity, stronger-identity learning, and
+  required downsample correction continue while optional appearance work stays off.
 - Preserve unknown foreign hook owners without re-chaining. Forwarding capability
   can recover after current evidence appears and expires under the existing quiet
   watchdog when the chain stops calling SpectralFix. Callback counts are diagnostic;
