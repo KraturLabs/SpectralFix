@@ -55,6 +55,32 @@ the startup script so it is present when FFXI creates the aura resources.
 Do not unload or reload SpectralFix while the game is running. Exit the entire
 client before replacing or removing the DLL.
 
+## Windows and Wine compatibility
+
+SpectralFix remains a 32-bit Windows Ashita plugin. Linux use means loading the
+same Windows DLL inside a 32-bit FFXI/Ashita process hosted by Wine; there is no
+native Linux build and the Ashita ABI is unchanged. Wine compatibility is
+experimental because v1.03 was not tested in a live Wine-hosted client.
+
+The plugin can use a direct FFXiMain caller when Wine or a wrapper cannot produce
+a usable stack fingerprint, and it can recognize two interface pointers that
+resolve to the same canonical COM device. Neither fallback broadens the resource
+shape: both FFXiMain identity fields absent, a different logical device, an
+unproven DrawPrimitiveUP path, or a conflicting saved selector keeps the original
+256x256 allocation.
+
+Alternate device-interface pointers are validated once and retained in a bounded
+cache, so normal draws do not repeat COM identity queries. A caller-only or
+stack-only saved selector also stays at 256x256 when both identity fields become
+available; aura activity can save that stronger selector for the next full launch.
+Only one matching candidate ID can be selected and confirmed in a session.
+
+Unknown graphics-hook owners are never overwritten. SetTexture observation can
+fall back to a narrow stage-zero query, while new enlargement remains blocked
+until required DrawPrimitiveUP correction is directly owned or recently observed
+forwarding into SpectralFix from the verified runtime device. Callbacks from a
+different device never count as forwarding evidence.
+
 ## Why this is a plugin instead of an addon
 
 Ashita addons are well suited to commands, interface changes, and normal game
@@ -97,6 +123,13 @@ load it during the next launch.
 Run `/spectralfix status` and include the displayed information when reporting the
 problem. SpectralFix also keeps a small troubleshooting log in
 `ashita/logs/spectralfix/`.
+
+For a Wine report, include the complete log from initialization through the aura
+test plus: Wine version and runner, whether the prefix/process is 32-bit, the
+Ashita interface package (4.16 or 4.30), the D3D8 implementation or wrapper,
+startup-script placement, Blur Effect state, and `/spectralfix status` before and
+after summoning an aura. Start with a fresh `spectralfix.ini`; if the log says a
+selector was learned, fully exit the client and repeat once with the saved file.
 
 ## License
 

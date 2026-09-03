@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(SpectralFix VERSION 1.02 LANGUAGES CXX)
+project(SpectralFix VERSION 1.03 LANGUAGES CXX)
 
 if (NOT WIN32)
     message(FATAL_ERROR "SpectralFix is a 32-bit Windows Ashita plugin.")
@@ -124,6 +124,17 @@ set_target_properties(spectralfix_runtime_safety_validation PROPERTIES
 )
 spectralfix_msvc_defaults(spectralfix_runtime_safety_validation)
 add_test(NAME spectralfix_runtime_safety COMMAND spectralfix_runtime_safety_validation)
+
+add_executable(spectralfix_device_alias_validation tests/device_alias_validation.cpp)
+target_include_directories(spectralfix_device_alias_validation PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_compile_features(spectralfix_device_alias_validation PRIVATE cxx_std_20)
+set_target_properties(spectralfix_device_alias_validation PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+spectralfix_msvc_defaults(spectralfix_device_alias_validation)
+add_test(NAME spectralfix_device_alias COMMAND spectralfix_device_alias_validation)
 
 add_executable(spectralfix_composite_state_validation tests/composite_state_validation.cpp)
 target_include_directories(spectralfix_composite_state_validation PRIVATE

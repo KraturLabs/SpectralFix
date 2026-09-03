@@ -4,12 +4,15 @@
 
 #pragma once
 
+#include "selector_policy.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
 namespace spectralfix
 {
     constexpr uint32_t kDrawChainMissThreshold = 3;
+    constexpr uint64_t kDrawForwardingFreshFrames = 180;
 
     // A snapshot of one vtable slot at the moment a decision is being made.
     struct HookSlotView
@@ -64,6 +67,145 @@ namespace spectralfix
         DrawChainHealth health{DrawChainHealth::inconclusive};
         uint32_t consecutiveMisses{0};
     };
+
+    struct DrawForwardingEvidence
+    {
+        uint64_t interceptedCallbacks{0};
+        uint64_t trustedRuntimeDraws{0};
+        uint64_t trustedAtLastSample{0};
+        bool forwardingObserved{false};
+        uint64_t lastForwardingFrame{0};
+        bool correctionLost{false};
+        bool recoveryPending{false};
+        uint32_t consecutiveMisses{0};
+    };
+
+    inline bool record_draw_callback(
+        DrawForwardingEvidence& evidence,
+        const DeviceIdentityResult deviceIdentity,
+        const bool drawSlotOwned,
+        const uint64_t currentFrame)
+    {
+        ++evidence.interceptedCallbacks;
+        if (deviceIdentity != DeviceIdentityResult::exactPointer
+            && deviceIdentity != DeviceIdentityResult::canonicalComIdentity)
+            return false;
+
+        ++evidence.trustedRuntimeDraws;
+        if (!drawSlotOwned)
+        {
+            const bool recovering = evidence.correctionLost;
+            evidence.forwardingObserved = true;
+            evidence.lastForwardingFrame = currentFrame;
+            evidence.correctionLost = false;
+            if (recovering)
+            {
+                evidence.recoveryPending = true;
+                evidence.consecutiveMisses = 0;
+            }
+        }
+        return true;
+    }
+
+    inline void begin_draw_owner_epoch(
+        DrawForwardingEvidence& evidence,
+        const bool correctionLost)
+    {
+        evidence.forwardingObserved = false;
+        evidence.correctionLost = correctionLost;
+        evidence.recoveryPending = false;
+        evidence.consecutiveMisses = 0;
+        evidence.trustedAtLastSample = evidence.trustedRuntimeDraws;
+    }
+
+    enum class StageZeroQueryActivationResult
+    {
+        activated,
+        alreadyActive,
+        slotUnavailable,
+        ownerUnavailable,
+        ownerStillOurs,
+    };
+
+    constexpr bool stage_zero_query_activation_succeeded(
+        const StageZeroQueryActivationResult result)
+    {
+        return result == StageZeroQueryActivationResult::activated
+            || result == StageZeroQueryActivationResult::alreadyActive;
+    }
+
+    constexpr const char* stage_zero_query_activation_name(
+        const StageZeroQueryActivationResult result)
+    {
+        switch (result)
+        {
+            case StageZeroQueryActivationResult::activated: return "activated";
+            case StageZeroQueryActivationResult::alreadyActive: return "already-active";
+            case StageZeroQueryActivationResult::slotUnavailable: return "slot-unavailable";
+            case StageZeroQueryActivationResult::ownerUnavailable: return "owner-unavailable";
+            default: return "owner-still-spectralfix";
+        }
+    }
+
+    struct RuntimeCapabilityInput
+    {
+        bool createCallbackActive{false};
+        bool drawSlotOwned{false};
+        bool drawForwardingObserved{false};
+        bool drawForwardingLost{false};
+        bool setTextureSlotOwned{false};
+        bool stageZeroQueryFallback{false};
+        bool baseEnlargementAllowed{false};
+        uint64_t currentFrame{0};
+        uint64_t lastDrawForwardingFrame{0};
+    };
+
+    struct RuntimeCapabilities
+    {
+        bool observeNewAllocations{false};
+        bool correctEnlargedDownsample{false};
+        bool observeStageZeroIdentity{false};
+        bool applyOptionalAppearance{false};
+        bool publishNewEnlargement{false};
+        bool drawForwardingRecent{false};
+    };
+
+    constexpr RuntimeCapabilities evaluate_runtime_capabilities(
+        const RuntimeCapabilityInput& input)
+    {
+        const bool forwardingRecent = input.drawForwardingObserved
+            && !input.drawForwardingLost
+            && input.currentFrame >= input.lastDrawForwardingFrame
+            && input.currentFrame - input.lastDrawForwardingFrame
+                <= kDrawForwardingFreshFrames;
+        const bool correction = input.drawSlotOwned || forwardingRecent;
+        const bool stageZero = input.setTextureSlotOwned || input.stageZeroQueryFallback;
+        return {
+            input.createCallbackActive,
+            correction,
+            stageZero,
+            correction && stageZero,
+            input.createCallbackActive && correction && input.baseEnlargementAllowed,
+            forwardingRecent,
+        };
+    }
+
+    struct DrawProcessingDecision
+    {
+        bool processMarkedTargetCore{false};
+        bool applyOptionalAppearance{false};
+    };
+
+    constexpr DrawProcessingDecision evaluate_draw_processing(
+        const bool enlargementPublished,
+        const bool auraFeaturesEnabled,
+        const RuntimeCapabilities& capabilities)
+    {
+        return {
+            enlargementPublished || auraFeaturesEnabled,
+            auraFeaturesEnabled && capabilities.applyOptionalAppearance,
+        };
+    }
 
     // A foreign function at the top of the DrawPrimitiveUP slot can still be
     // safely forwarding to SpectralFix. Treat one quiet sample as inconclusive;

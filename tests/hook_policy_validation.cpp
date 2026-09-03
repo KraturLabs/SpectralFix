@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <string>
 
 namespace
 {
@@ -124,6 +125,174 @@ int main()
     {
         std::cerr << "an owned draw slot did not clear the watchdog\n";
         return 12;
+    }
+
+    RuntimeCapabilityInput capability{};
+    capability.createCallbackActive = true;
+    capability.drawSlotOwned = true;
+    capability.setTextureSlotOwned = true;
+    capability.baseEnlargementAllowed = true;
+    auto runtime = evaluate_runtime_capabilities(capability);
+    if (!runtime.publishNewEnlargement || !runtime.correctEnlargedDownsample
+        || !runtime.observeStageZeroIdentity || !runtime.applyOptionalAppearance)
+    {
+        std::cerr << "directly owned hooks did not expose full capabilities\n";
+        return 13;
+    }
+
+    // SetTexture loss only switches stage-zero identity to the narrow query path;
+    // allocation observation and required draw correction remain independent.
+    capability.setTextureSlotOwned = false;
+    capability.stageZeroQueryFallback = true;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (!runtime.publishNewEnlargement || !runtime.observeStageZeroIdentity
+        || !runtime.applyOptionalAppearance)
+    {
+        std::cerr << "SetTexture query fallback disabled unrelated capabilities\n";
+        return 14;
+    }
+
+    capability.drawSlotOwned = false;
+    capability.drawForwardingObserved = false;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (runtime.publishNewEnlargement || runtime.correctEnlargedDownsample)
+    {
+        std::cerr << "unknown DrawPrimitiveUP forwarding permitted enlargement\n";
+        return 15;
+    }
+
+    capability.currentFrame = 100;
+    capability.lastDrawForwardingFrame = 99;
+    capability.drawForwardingObserved = true;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (!runtime.drawForwardingRecent || !runtime.publishNewEnlargement)
+    {
+        std::cerr << "recent DrawPrimitiveUP forwarding did not recover enlargement\n";
+        return 16;
+    }
+
+    capability.drawForwardingLost = true;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (runtime.publishNewEnlargement || runtime.correctEnlargedDownsample)
+    {
+        std::cerr << "lost DrawPrimitiveUP forwarding still permitted enlargement\n";
+        return 17;
+    }
+
+    capability.drawForwardingLost = false;
+    capability.currentFrame = 101;
+    capability.lastDrawForwardingFrame = 101;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (!runtime.publishNewEnlargement || !runtime.correctEnlargedDownsample)
+    {
+        std::cerr << "renewed DrawPrimitiveUP evidence did not recover capabilities\n";
+        return 18;
+    }
+
+    capability.currentFrame = kDrawForwardingFreshFrames + 200;
+    capability.lastDrawForwardingFrame = 1;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (runtime.drawForwardingRecent || runtime.publishNewEnlargement)
+    {
+        std::cerr << "stale DrawPrimitiveUP evidence still permitted enlargement\n";
+        return 19;
+    }
+
+    capability.drawSlotOwned = true;
+    capability.createCallbackActive = false;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (runtime.observeNewAllocations || runtime.publishNewEnlargement
+        || !runtime.correctEnlargedDownsample)
+    {
+        std::cerr << "CreateTexture loss incorrectly disabled live correction\n";
+        return 20;
+    }
+
+
+    DrawForwardingEvidence evidence{};
+    evidence.correctionLost = true;
+    if (record_draw_callback(evidence, DeviceIdentityResult::mismatch, false, 100)
+        || evidence.trustedRuntimeDraws != 0
+        || evidence.forwardingObserved
+        || !evidence.correctionLost
+        || evidence.recoveryPending)
+    {
+        std::cerr << "wrong-device traffic changed trusted forwarding evidence\n";
+        return 21;
+    }
+    capability.drawSlotOwned = false;
+    capability.drawForwardingObserved = evidence.forwardingObserved;
+    capability.drawForwardingLost = evidence.correctionLost;
+    capability.createCallbackActive = true;
+    capability.baseEnlargementAllowed = true;
+    runtime = evaluate_runtime_capabilities(capability);
+    if (runtime.publishNewEnlargement || runtime.correctEnlargedDownsample)
+    {
+        std::cerr << "wrong-device traffic unlocked enlargement capability\n";
+        return 22;
+    }
+    if (!record_draw_callback(
+            evidence, DeviceIdentityResult::canonicalComIdentity, false, 101)
+        || evidence.trustedRuntimeDraws != 1
+        || !evidence.forwardingObserved
+        || evidence.correctionLost
+        || !evidence.recoveryPending
+        || evidence.lastForwardingFrame != 101)
+    {
+        std::cerr << "trusted-device traffic did not recover forwarding evidence\n";
+        return 23;
+    }
+    begin_draw_owner_epoch(evidence, true);
+    if (evidence.forwardingObserved || !evidence.correctionLost
+        || evidence.trustedAtLastSample != evidence.trustedRuntimeDraws
+        || evidence.consecutiveMisses != 0)
+    {
+        std::cerr << "draw-owner epoch did not reset trusted sampling state\n";
+        return 24;
+    }
+    if (evaluate_draw_chain_sample(false, evidence.trustedRuntimeDraws,
+            evidence.trustedAtLastSample, 2, 3).health != DrawChainHealth::lost)
+    {
+        std::cerr << "wrong-device callbacks kept the trusted watchdog alive\n";
+        return 25;
+    }
+
+    if (!stage_zero_query_activation_succeeded(StageZeroQueryActivationResult::activated)
+        || !stage_zero_query_activation_succeeded(StageZeroQueryActivationResult::alreadyActive)
+        || stage_zero_query_activation_succeeded(StageZeroQueryActivationResult::ownerUnavailable)
+        || std::string(stage_zero_query_activation_name(
+            StageZeroQueryActivationResult::ownerStillOurs)) != "owner-still-spectralfix")
+    {
+        std::cerr << "stage-zero query activation diagnostics are incorrect\n";
+        return 26;
+    }
+
+    // If neither SetTexture observation nor the stage-zero query fallback is
+    // available, marked-target activity and required downsample correction must
+    // still reach the core draw path. Optional tap/composite work remains blocked.
+    capability = RuntimeCapabilityInput{};
+    capability.createCallbackActive = true;
+    capability.drawSlotOwned = true;
+    capability.baseEnlargementAllowed = true;
+    runtime = evaluate_runtime_capabilities(capability);
+    const auto drawProcessing = evaluate_draw_processing(false, true, runtime);
+    const auto disabledWithoutEnlargement = evaluate_draw_processing(false, false, runtime);
+    const auto disabledWithEnlargement = evaluate_draw_processing(true, false, runtime);
+    const auto strongerIdentity = evaluate_selector_match(
+        1, 2, 3, 0, 1, 1, 2, 3, 4, 1);
+    if (!runtime.correctEnlargedDownsample
+        || runtime.observeStageZeroIdentity
+        || runtime.applyOptionalAppearance
+        || !drawProcessing.processMarkedTargetCore
+        || drawProcessing.applyOptionalAppearance
+        || disabledWithoutEnlargement.processMarkedTargetCore
+        || disabledWithoutEnlargement.applyOptionalAppearance
+        || !disabledWithEnlargement.processMarkedTargetCore
+        || disabledWithEnlargement.applyOptionalAppearance
+        || !selector_match_requires_learning(strongerIdentity))
+    {
+        std::cerr << "missing stage-zero identity blocked core draw processing or allowed optional appearance\n";
+        return 27;
     }
 
     return 0;
