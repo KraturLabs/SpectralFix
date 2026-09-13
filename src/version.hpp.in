@@ -1,0 +1,7 @@
+#pragma once
+
+namespace spectralfix
+{
+    inline constexpr char kVersionString[] = "@PROJECT_VERSION@";
+    inline constexpr double kPluginVersion = @PROJECT_VERSION_MAJOR@.@PROJECT_VERSION_MINOR@;
+}
