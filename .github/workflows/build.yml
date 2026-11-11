@@ -37,9 +37,3 @@ jobs:
           -AshitaVersion '${{ matrix.interface }}'
           -AshitaSdkPath '${{ github.workspace }}\deps\ashita\plugins\sdk'
 
-      - name: Upload package
-        uses: actions/upload-artifact@v7
-        with:
-          name: SpectralFix-Ashita-${{ matrix.interface }}
-          path: out/packages/*.zip
-          if-no-files-found: error
