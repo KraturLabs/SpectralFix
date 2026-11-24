@@ -1,9 +1,8 @@
 name: Release
 
+# Manual only: push the v* tag, then Actions > Release > Run workflow and pick that tag.
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
